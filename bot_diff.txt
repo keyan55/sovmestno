@@ -1,0 +1,3458 @@
+diff --git a/bot1.py b/bot.py
+index ab7cec8..d6736ba 100644
+--- a/bot1.py
++++ b/bot.py
+@@ -9,6 +9,10 @@ except Exception:
+     pass
+ import asyncio
+ import random
++import imap_runtime
++from imap_runtime import init_imap_runtime, start_imap_for_account, RESULT_QUEUE
++init_imap_runtime()
++import email as _email
+ import smtplib
+ from io import BytesIO
+ from typing import List, Dict, Any, Optional, Tuple, Iterable, TYPE_CHECKING
+@@ -414,69 +418,13 @@ def klein_templates_kb(base_mid: int) -> InlineKeyboardMarkup:
+ CLEANUP_INTERVAL = 60  # seconds
+ 
+ SHARED_EXECUTOR = ThreadPoolExecutor(max_workers=60)  # Оптимизировано под 13 пользователей (HTTP запросы: короткие ссылки, метаданные)
+-# Расчет: 13 пользователей × ~5 параллельных HTTP запросов на пользователя = 65 воркеров
+-# Используем 60 воркеров с небольшим запасом для обработки пиковых нагрузок
+-
+-# ===== IMAP constants (REPLACE THIS WHOLE BLOCK) =====
+-IMAP_EXECUTOR = ThreadPoolExecutor(max_workers=10)  # Заглушка для совместимости с rotation_run
+-
+-# Размер пула процессов под ваш сервер (8 CPU, 16 GB RAM):
+-# ВАЖНО: Каждый процесс multiprocessing.spawn потребляет ~180 MB RAM (базовая память Python интерпретатора)
+-# Это базовая стоимость процесса и ее нельзя уменьшить без изменения архитектуры.
+-# 
+-# РЕАЛЬНОЕ ИСПОЛЬЗОВАНИЕ ПАМЯТИ (по данным top):
+-# - Каждый процесс: ~140-220 MB (в среднем ~180 MB)
+-# - При 32 процессах: 32 × 180 MB = ~5.7 GB (только воркеры)
+-# - Основной процесс бота: ~1.2 GB
+-# - ИТОГО: ~7 GB (но реально используется 10.8 GB + 1.4 GB swap)
+-#
+-# ПРОБЛЕМА: Использование памяти выше ожидаемого
+-# РЕШЕНИЕ: Уменьшаем количество процессов и увеличиваем аккаунтов на процесс
+-#
+-# Оптимизированная конфигурация для полной нагрузки (13 пользователей, 1,261 аккаунт):
+-# ПРОБЛЕМА: При полной нагрузке нужно обработать 1,261 аккаунт
+-# - 20 процессов × 180 MB = ~3.6 GB (воркеры)
+-# - 20 процессов × 65 аккаунтов = 1,300 аккаунтов (достаточно для 1,261)
+-# - Основной процесс: ~1.2 GB
+-# - ИТОГО: ~4.8-5.5 GB (приемлемо для 16 GB сервера)
+-# 
+-# ВАЖНО: При добавлении аккаунтов память процесса может расти до ~200-250 MB
+-# Реальное использование: 20 процессов × 220 MB = ~4.4 GB (с запасом)
+-IMAP_PROCESS_POOL_SIZE = 34  # Чуть увеличено для более стабильного чтения (1,261 аккаунта / 13 пользователей)
++
++
+ 
+ # Целевой интервал опроса каждого ящика:
+ IMAP_POLL_INTERVAL_MIN = 5.0
+ IMAP_POLL_INTERVAL_MAX = 6.0
+ 
+-# Таймауты (с учетом SOCKS/SSL):
+-IMAP_TIMEOUT = 12
+-IMAP_CONNECTION_TIMEOUT = 10
+-IMAP_SOCKET_TIMEOUT = 10
+-IMAP_READ_TIMEOUT = 8
+-IMAP_WRITE_TIMEOUT = 6
+-IMAP_NOOP_TIMEOUT = 3
+-
+-# Переподключения / бэкофф:
+-IMAP_RECONNECT_DELAY = 2.0
+-IMAP_MAX_RECONNECT_ATTEMPTS = 3
+-IMAP_BACKOFF_MAX = 600.0  # до 10 минут
+-
+-# Ограничения очередей:
+-IMAP_ACCOUNT_QUEUE_MAXSIZE = 512    # Очередь задач аккаунтов
+-IMAP_RESULT_QUEUE_MAXSIZE = 2048    # Очередь результатов
+-
+-# Инициализируются при старте:
+-IMAP_ACCOUNT_QUEUE: Queue = None
+-IMAP_RESULT_QUEUE: Queue = None
+-IMAP_WORKER_PROCESSES: list[Process] = []
+-IMAP_WORKER_STOP_EVENT: Event = None
+-IMAP_MP_CONTEXT = None  # Контекст multiprocessing для создания процессов
+-
+-# Статус аккаунтов:
+-IMAP_ACCOUNT_STATUS: dict[tuple[int, int], dict] = {}
+-
+-# Статус пользователей IMAP (для совместимости с кодом, использующим ensure_user_imap_status)
+-IMAP_STATUS: dict[int, "UserImapStatus"] = {}
+ # ===== END IMAP constants BLOCK =====
+ 
+ CLEANUP_PERIOD = 48 * 3600  # 48 часов между одноразовыми запусками
+@@ -781,7 +729,8 @@ async def build_incoming_reply_kb_async(chat_id: int, message_id: int) -> Inline
+ 
+     has_link = False
+     try:
+-        rt = INCOMING_RT.get((internal_uid, message_id))
++        # Пробуем сначала с internal_uid (для новых записей), потом с chat_id (для старых)
++        rt = INCOMING_RT.get((internal_uid, message_id)) or INCOMING_RT.get((chat_id, message_id))
+         if rt:
+             from_email = (rt.get("from_email") or "").strip()
+             if "@" in from_email:
+@@ -984,6 +933,12 @@ VERSION = "v212"
+ # ====== Constants ======
+ READ_INTERVAL = 15  # seconds (legacy, не используется в новой архитектуре)
+ IMAP_PORT_SSL = 993
++# IMAP таймауты импортируются из imap_runtime
++IMAP_CONNECTION_TIMEOUT = imap_runtime.IMAP_CONNECTION_TIMEOUT
++IMAP_SOCKET_TIMEOUT = imap_runtime.IMAP_SOCKET_TIMEOUT
++IMAP_READ_TIMEOUT = imap_runtime.IMAP_READ_TIMEOUT
++IMAP_TIMEOUT = imap_runtime.IMAP_CONNECTION_TIMEOUT  # Используем CONNECTION_TIMEOUT как общий таймаут
++IMAP_NOOP_TIMEOUT = imap_runtime.IMAP_NOOP_TIMEOUT
+ MAX_EMAILS_PER_USER = 97
+ IMAP_HOST_MAP = {
+     "gmail.com": "imap.gmail.com",
+@@ -1025,6 +980,9 @@ USER_CTX_CACHE = TTLCache(maxsize=1000, ttl=172800)  # 48 часов
+ DOMAINS_CACHE = TTLCache(maxsize=1000, ttl=300)
+ INCOMING_RT: TTLCache = TTLCache(maxsize=10000, ttl=172800)  # 48h
+ THREAD_LAST_OUT: TTLCache = TTLCache(maxsize=20000, ttl=7 * 86400)  # 7 дней
++# Кэш для отслеживания уже обработанных IMAP писем: (user_id, acc_id, uid) -> True
++# TTL = 7 дней (достаточно, чтобы избежать повторной публикации даже после перезапуска)
++IMAP_PROCESSED_MESSAGES: TTLCache = TTLCache(maxsize=200000, ttl=7 * 86400)
+ # Логирование производительности
+ perf_logger = logging.getLogger("performance")
+ 
+@@ -1243,28 +1201,6 @@ class ImapAccountConfig:
+             proxy=d.get("proxy")
+         )
+ 
+-
+-class UserImapStatus:
+-    """Статус IMAP для пользователя (для совместимости с кодом, использующим ensure_user_imap_status)"""
+-    def __init__(self, user_id: int):
+-        self.user_id = user_id
+-        self.running = False
+-        self.accounts: dict[str, Any] = {}
+-        self.account_status: dict[str, dict] = {}
+-        self.account_backoff: dict[str, float] = {}  # Время задержки для каждого аккаунта (email -> timestamp)
+-        self.last_accounts_check = 0.0
+-        self.lock = asyncio.Lock()
+-
+-
+-def ensure_user_imap_status(user_id: int) -> UserImapStatus:
+-    """
+-    Получает или создает статус IMAP для пользователя.
+-    ВАЖНО: Эта функция нужна для совместимости с кодом, который использует старую архитектуру.
+-    Новая архитектура использует IMAP_ACCOUNT_STATUS напрямую.
+-    """
+-    if user_id not in IMAP_STATUS:
+-        IMAP_STATUS[user_id] = UserImapStatus(user_id)
+-    return IMAP_STATUS[user_id]
+     
+ async def _pick_rr_account_id(uid: int) -> Optional[int]:
+     """
+@@ -1410,18 +1346,6 @@ LAST_XLSX_PER_CHAT: Dict[int, dict] = {}  # { chat_id: {"data": bytes, "timestam
+ BASES_PER_CHAT: Dict[int, List[str]] = {}
+ VERIFIED_ROWS_PER_CHAT: Dict[int, List[Dict[str, Any]]] = {}
+ 
+-# ====== УДАЛЕНО: Старая логика IMAP (async воркеры) ======
+-# Используется только новая архитектура с process pool
+-# Старые классы и функции удалены:
+-# - class UserImapStatus - УДАЛЕНО
+-# - def ensure_user_imap_status - УДАЛЕНО
+-# - IMAP_STATUS - УДАЛЕНО
+-# - IMAP_TASKS - УДАЛЕНО
+-# - async def _refresh_active_accounts_for_user - УДАЛЕНО
+-# - async def _pick_next_email - УДАЛЕНО
+-# - async def imap_loop_optimized - УДАЛЕНО
+-# - USER_IMAP_WORKERS - УДАЛЕНО
+-# - IMAP_USER_TICK, IMAP_ACCOUNTS_REFRESH_SEC, IMAP_MIN_GAP_SAME, IMAP_EST_FETCH_SEC, IMAP_PARALLEL_PER_USER - УДАЛЕНО
+ 
+ 
+ SEND_TASKS: Dict[int, asyncio.Task] = {}
+@@ -4527,9 +4451,48 @@ async def emails_list(c: types.CallbackQuery):
+ 
+ async def _ensure_imap_started_for_user(uid: int, chat_id: int):
+     """
+-    Новая архитектура: используем process pool. Аккаунты добавляются в очередь через start_imap_process.
++    Старт IMAP-воркеров для всех активных аккаунтов пользователя через новый imap_runtime.
++    Используется только для обычного чтения (кнопки /read, imap:start_all и т.п.).
+     """
+-    await _schedule_all_active_accounts(uid, chat_id)
++    accounts = await _get_user_accounts(uid)
++    # если у твоей модели аккаунта нет поля active, убери фильтр active_accounts
++    active_accounts = [a for a in accounts if getattr(a, "active", False)]
++
++    if not active_accounts:
++        log_send_event(f"IMAP_RUNTIME: no active accounts for uid={uid}, nothing to start")
++        return
++
++    for acc in active_accounts:
++        email = getattr(acc, "email", "")
++        if not email:
++            continue
++
++        host = resolve_imap_host(email)
++
++        # прокси для аккаунта
++        try:
++            proxy = await get_account_proxy_async(uid, email)
++        except Exception as e:
++            log_send_event(f"IMAP_RUNTIME: get_account_proxy_async failed uid={uid} acc_id={acc.id} email={email}: {e}")
++            proxy = None
++
++        cfg_rt = imap_runtime.ImapAccountConfig(
++            user_id=uid,
++            acc_id=int(getattr(acc, "id")),
++            email=email,
++            password=getattr(acc, "password", ""),
++            display_name=getattr(acc, "display_name", "") or getattr(acc, "name", "") or "",
++            chat_id=chat_id,
++            host=host,
++            proxy=proxy,
++        )
++        try:
++            imap_runtime.start_imap_for_account(cfg_rt)
++            # Обновляем статус аккаунта как активный
++            key = (uid, int(getattr(acc, "id")))
++            IMAP_ACCOUNT_STATUS[key] = {"active": True, "email": email}
++        except Exception as e:
++            log_send_event(f"IMAP_RUNTIME: failed to start worker uid={uid} acc_id={acc.id} email={email}: {e}")
+ 
+ @dp.callback_query(F.data == "emails:add")
+ async def emails_add(c: types.CallbackQuery, state: FSMContext):
+@@ -5885,6 +5848,75 @@ async def _verify_emails_from_cache_once(uid: int, chat_id: int) -> list[dict]:
+             await bot.send_message(chat_id, hint)
+             return []
+ 
++        # ВАЖНО: Обновляем AD-кэш после проверки email
++        # Добавляем найденные email в AD_LOCAL2ID_PER_CHAT, связывая их с соответствующими ad_id
++        try:
++            import re as _re, unicodedata, hashlib as _hashlib
++            def _norm_local(s: str) -> str:
++                s = (s or "").replace("\u00A0", " ")
++                s = unicodedata.normalize("NFKC", s)
++                s = s.replace(".", " ").replace("_", " ").replace("-", " ")
++                s = _re.sub(r"\s+", " ", s.strip().lower())
++                return s
++
++            ads_map = AD_ADS_BY_ID_PER_CHAT.get(chat_id, {})
++            local_map = AD_LOCAL2ID_PER_CHAT.setdefault(chat_id, {})
++
++            # Используем уже прочитанный df для получения соответствия seller_nick -> ad_id
++            try:
++                # Определяем колонки
++                seller_col = None
++                link_col = None
++                lowered = {str(c).strip().lower(): c for c in df.columns}
++                for cand in ("seller_nick", "имя продавца"):
++                    if cand in lowered:
++                        seller_col = lowered[cand]
++                        break
++                if "ссылка на объявление" in lowered:
++                    link_col = lowered["ссылка на объявление"]
++                else:
++                    for c in df.columns:
++                        nm = str(c).strip().lower()
++                        if "ссылка" in nm and "объяв" in nm:
++                            link_col = c
++                            break
++
++                if seller_col and link_col and seller_col in df.columns and link_col in df.columns:
++                    # Создаем маппинг seller_name -> ad_id
++                    seller_to_ad_id = {}
++                    for raw_nick, raw_link in zip(df[seller_col], df[link_col]):
++                        raw_nick = str(raw_nick).strip()
++                        raw_link = str(raw_link).strip()
++                        if not raw_nick or not raw_link:
++                            continue
++                        ad_id = _hashlib.sha1(f"{raw_nick}||{raw_link}".encode("utf-8")).hexdigest()[:12]
++                        seller_to_ad_id[raw_nick] = ad_id
++
++                    # Обновляем AD-кэш найденными email
++                    for result in results:
++                        email = result.get("email", "")
++                        seller_name = result.get("seller_name", "")
++                        if email and "@" in email and seller_name:
++                            local_part = email.split("@", 1)[0]
++                            k_local = _norm_local(local_part)
++                            # Находим ad_id по seller_name
++                            ad_id = seller_to_ad_id.get(seller_name)
++                            if ad_id and ad_id in ads_map:
++                                # Добавляем email в AD_LOCAL2ID_PER_CHAT
++                                if k_local not in local_map:
++                                    local_map[k_local] = ad_id
++                                # Добавляем вариант в variants объявления
++                                ad_entry = ads_map.get(ad_id)
++                                if ad_entry and "variants" in ad_entry:
++                                    ad_entry["variants"].add(k_local)
++                    
++                    # Сохраняем обновленный кэш на диск
++                    await save_ad_cache_async(chat_id)
++            except Exception as e_update:
++                log_send_event(f"AD cache update after verify (auto) error chat={chat_id}: {e_update}")
++        except Exception as e_cache:
++            log_send_event(f"AD cache update after verify (auto) error chat={chat_id}: {e_cache}")
++
+         # Печатаем список, как кнопка
+         emails = [r["email"] for r in results]
+         for chunk in join_batches([f"№{i} {code(e)}" for i, e in enumerate(emails, start=1)], 50):
+@@ -6059,6 +6091,82 @@ async def verify_emails_btn(c: types.CallbackQuery, state: FSMContext):
+             await bot.send_message(chat_id, hint)
+             return
+ 
++        # ВАЖНО: Обновляем AD-кэш после проверки email
++        # Добавляем найденные email в AD_LOCAL2ID_PER_CHAT, связывая их с соответствующими ad_id
++        try:
++            import re as _re, unicodedata, hashlib as _hashlib
++            def _norm_local(s: str) -> str:
++                s = (s or "").replace("\u00A0", " ")
++                s = unicodedata.normalize("NFKC", s)
++                s = s.replace(".", " ").replace("_", " ").replace("-", " ")
++                s = _re.sub(r"\s+", " ", s.strip().lower())
++                return s
++
++            ads_map = AD_ADS_BY_ID_PER_CHAT.get(chat_id, {})
++            local_map = AD_LOCAL2ID_PER_CHAT.setdefault(chat_id, {})
++
++            # Читаем XLSX для получения соответствия seller_nick -> ad_id
++            xls_entry = LAST_XLSX_PER_CHAT.get(chat_id)
++            if xls_entry:
++                xls_bytes = xls_entry.get("data") if isinstance(xls_entry, dict) else xls_entry
++                if xls_bytes:
++                    try:
++                        loop = asyncio.get_running_loop()
++                        df_xls = await loop.run_in_executor(SHARED_EXECUTOR, pd.read_excel, BytesIO(xls_bytes))
++                        
++                        # Определяем колонки
++                        seller_col = None
++                        link_col = None
++                        lowered = {str(c).strip().lower(): c for c in df_xls.columns}
++                        for cand in ("seller_nick", "имя продавца"):
++                            if cand in lowered:
++                                seller_col = lowered[cand]
++                                break
++                        if "ссылка на объявление" in lowered:
++                            link_col = lowered["ссылка на объявление"]
++                        else:
++                            for c in df_xls.columns:
++                                nm = str(c).strip().lower()
++                                if "ссылка" in nm and "объяв" in nm:
++                                    link_col = c
++                                    break
++
++                        if seller_col and link_col and seller_col in df_xls.columns and link_col in df_xls.columns:
++                            # Создаем маппинг seller_name -> ad_id
++                            seller_to_ad_id = {}
++                            for raw_nick, raw_link in zip(df_xls[seller_col], df_xls[link_col]):
++                                raw_nick = str(raw_nick).strip()
++                                raw_link = str(raw_link).strip()
++                                if not raw_nick or not raw_link:
++                                    continue
++                                ad_id = _hashlib.sha1(f"{raw_nick}||{raw_link}".encode("utf-8")).hexdigest()[:12]
++                                seller_to_ad_id[raw_nick] = ad_id
++
++                            # Обновляем AD-кэш найденными email
++                            for result in results:
++                                email = result.get("email", "")
++                                seller_name = result.get("seller_name", "")
++                                if email and "@" in email and seller_name:
++                                    local_part = email.split("@", 1)[0]
++                                    k_local = _norm_local(local_part)
++                                    # Находим ad_id по seller_name
++                                    ad_id = seller_to_ad_id.get(seller_name)
++                                    if ad_id and ad_id in ads_map:
++                                        # Добавляем email в AD_LOCAL2ID_PER_CHAT
++                                        if k_local not in local_map:
++                                            local_map[k_local] = ad_id
++                                        # Добавляем вариант в variants объявления
++                                        ad_entry = ads_map.get(ad_id)
++                                        if ad_entry and "variants" in ad_entry:
++                                            ad_entry["variants"].add(k_local)
++                            
++                            # Сохраняем обновленный кэш на диск
++                            await save_ad_cache_async(chat_id)
++                    except Exception as e_update:
++                        log_send_event(f"AD cache update after verify error chat={chat_id}: {e_update}")
++        except Exception as e_cache:
++            log_send_event(f"AD cache update after verify error chat={chat_id}: {e_cache}")
++
+         emails = [r["email"] for r in results]
+         for chunk in join_batches([f"№{i} {code(e)}" for i, e in enumerate(emails, start=1)], 50):
+             await bot.send_message(chat_id, chunk)
+@@ -7156,7 +7264,9 @@ async def reply_msg_cb(c: types.CallbackQuery, state: FSMContext):
+ 
+     # 2. Если нет в БД — fallback к runtime
+     if not row:
+-        rt = INCOMING_RT.get((internal_uid, tg_mid))
++        # Пробуем сначала с internal_uid, потом с chat_id (для обратной совместимости со старыми записями)
++        chat_id = c.message.chat.id
++        rt = INCOMING_RT.get((internal_uid, tg_mid)) or INCOMING_RT.get((chat_id, tg_mid))
+         if rt:
+             acc_id = int(rt.get("acc_id"))
+             to_email = rt.get("from_email") or ""
+@@ -8399,7 +8509,11 @@ async def quickadd_lines_text(m: types.Message, state: FSMContext):
+                         proxy=proxy
+                     )
+                     if success:
+-                        # ВАЖНО: Обновляем статус аккаунта в IMAP_STATUS для отображения в статусе
++                        # ВАЖНО: Обновляем статус аккаунта в IMAP_ACCOUNT_STATUS для отображения в статусе
++                        key = (uid, int(acc.id))
++                        IMAP_ACCOUNT_STATUS[key] = {"active": True, "email": email_addr}
++                        
++                        # Также обновляем старую структуру для совместимости
+                         st_imap = ensure_user_imap_status(uid)
+                         async with st_imap.lock:
+                             st_imap.running = True
+@@ -8495,153 +8609,25 @@ import pickle
+ 
+ 
+ 
+-def _imap_worker_pool_worker(account_queue: Queue, result_queue: Queue, stop_event: Event,
+-                             poll_interval_min: float, poll_interval_max: float, 
+-                             connection_timeout: float, read_timeout: float, write_timeout: float,
+-                             noop_timeout: float, reconnect_delay: float, max_reconnect_attempts: int, port_ssl: int):
+-    """
+-    Воркер процесс-пула - обрабатывает аккаунты из очереди с открытыми соединениями.
+-    ВАЖНО: Все IMAP операции используют таймауты для предотвращения зависаний.
+-    Старые соединения правильно закрываются (shutdown + close) для предотвращения залипания сокетов.
+-    
+-    АРХИТЕКТУРА:
+-    - Воркер берет аккаунты из очереди и добавляет в свой account_states
+-    - Соединения остаются открытыми между опросами (state["imap"])
+-    - Каждый аккаунт опрашивается с интервалом 5 секунд (next_poll_time)
+-    - Аккаунты обрабатываются по очереди - воркер проходит по account_states и опрашивает готовые
+-    - После опроса аккаунт остается в account_states с обновленным next_poll_time
+-    
+-    ПРОИЗВОДИТЕЛЬНОСТЬ (оптимизировано для 30 процессов при полной нагрузке 1,261 аккаунт):
+-    - С открытым соединением один опрос: ~0.3-0.8 секунды (UNSEEN + fetch)
+-    - Среднее время на аккаунт: ~0.5 секунды
+-    - За 5 секунд один процесс может опросить: 5 / 0.5 = 10 аккаунтов
+-    - При 30 процессах: 30 * 10 = 300 аккаунтов за 5 секунд
+-    - Скорость опроса: 300 / 5 = 60 аккаунтов/секунду
+-    - Для 1,261 аккаунта: 1,261 / 60 = ~21 секунда на полный цикл (приемлемо при интервале опроса 5-6 секунд)
+-    - Каждый процесс обрабатывает ~42 аккаунта (1,261 / 30), что соответствует интервалу опроса 5-6 секунд
+-    
+-    ВАЖНО: Автоматическое переподключение при разрыве соединения
+-    - При разрыве соединения (проверка через NOOP) происходит автоматическое переподключение
+-    - При временных ошибках - повторная попытка с задержкой
+-    - При постоянных ошибках авторизации - аккаунт удаляется из обработки
+-    """
+-    import imaplib
+-    import ssl
+-    import socket
+-    import socks
+-    import time as _time
+-    import random as _random
+-    import re
+-    import html as html_module
+-    from html.parser import HTMLParser
+-    from html import unescape as html_unescape
+-    
+-    # Функция извлечения текста из HTML (копия из основного модуля)
+-    def _extract_text_from_html(html_text: str) -> str:
+-        """Извлекает чистый текст из HTML, обрабатывает HTML entities и удаляет подписи."""
+-        class TextExtractor(HTMLParser):
+-            def __init__(self):
+-                super().__init__()
+-                self.text_parts = []
+-                self.in_script = False
+-                self.in_style = False
+-                
+-            def handle_starttag(self, tag, attrs):
+-                tag_lower = tag.lower()
+-                if tag_lower in ('script', 'style'):
+-                    if tag_lower == 'script':
+-                        self.in_script = True
+-                    else:
+-                        self.in_style = True
+-                elif tag_lower == 'br':
+-                    self.text_parts.append('\n')
+-                    
+-            def handle_endtag(self, tag):
+-                tag_lower = tag.lower()
+-                if tag_lower in ('script', 'style'):
+-                    if tag_lower == 'script':
+-                        self.in_script = False
+-                    else:
+-                        self.in_style = False
+-                elif tag_lower in ('div', 'p', 'li', 'ul', 'ol', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'tr', 'blockquote', 'pre'):
+-                    self.text_parts.append('\n')
+-                elif tag_lower in ('td', 'th'):
+-                    self.text_parts.append('\t')
+-                elif tag_lower == 'br':
+-                    self.text_parts.append('\n')
+-                    
+-            def handle_data(self, data):
+-                if not self.in_script and not self.in_style:
+-                    self.text_parts.append(data)
+-        
+-        try:
+-            html_text = html_module.unescape(html_text)
+-            parser = TextExtractor()
+-            parser.feed(html_text)
+-            text = ''.join(parser.text_parts)
+-            text = re.sub(r'<[^>]+>', ' ', text)
+-            text = re.sub(r'&nbsp;', ' ', text)
+-            text = re.sub(r'&amp;', '&', text)
+-            text = re.sub(r'&lt;', '<', text)
+-            text = re.sub(r'&gt;', '>', text)
+-            text = re.sub(r'[ \t]+', ' ', text)
+-            text = re.sub(r'[ \t]*\n[ \t]*', '\n', text)
+-            text = re.sub(r'\n{3,}', '\n\n', text)
+-            lines = text.split('\n')
+-            text = '\n'.join(line.rstrip() for line in lines)
+-            
+-            # Удаляем подписи GMX
+-            lines = text.split('\n')
+-            if len(lines) > 5:
+-                main_lines = lines[:-5]
+-                signature_candidate = lines[-5:]
+-                signature_text = '\n'.join(signature_candidate).lower()
+-                has_signature = any(marker in signature_text for marker in [
+-                    'gesendet mit der gmx', 'sent with gmx', 'gmx mail app',
+-                ])
+-                if has_signature:
+-                    sig_start = len(main_lines)
+-                    for i in range(len(signature_candidate) - 1, -1, -1):
+-                        line_lower = signature_candidate[i].lower().strip()
+-                        if any(marker in line_lower for marker in [
+-                            'gesendet mit der gmx', 'sent with gmx', 'gmx mail app',
+-                        ]):
+-                            for j in range(i - 1, -1, -1):
+-                                if signature_candidate[j].strip() == '--':
+-                                    sig_start = len(main_lines) + j
+-                                    break
+-                            break
+-                    filtered_lines = lines[:sig_start] if sig_start < len(lines) else main_lines
+-                else:
+-                    filtered_lines = lines
+-            else:
+-                filtered_lines = lines
+-            
+-            return '\n'.join(filtered_lines).strip()
+-        except Exception:
+-            # Fallback: простое удаление тегов
+-            text = html_unescape(html_text)
+-            text = re.sub(r'<[^>]+>', ' ', text)
+-            text = re.sub(r'&nbsp;', ' ', text)
+-            return text.strip()
++
++
++# Словарь для хранения состояния каждого аккаунта (email -> state)
++# state = {"config": ImapAccountConfig, "imap": imaplib.IMAP4, "next_poll_time": float, "last_poll_time": float, "reconnect_attempts": int}
++account_states: dict[str, dict] = {}
+     
+-    # Словарь для хранения состояния каждого аккаунта (email -> state)
+-    # state = {"config": ImapAccountConfig, "imap": imaplib.IMAP4, "next_poll_time": float, "last_poll_time": float, "reconnect_attempts": int}
+-    account_states: dict[str, dict] = {}
+-    
+-    # ВАЖНО: Периодическая очистка памяти (gc.collect) для освобождения памяти от закрытых соединений
+-    # НЕ удаляем аккаунты вообще - только помечаем как неактивные при ошибках авторизации
+-    # Аккаунты с ошибками авторизации помечаются как disabled=True и пропускаются при обработке
+-    last_cleanup_time = _time.time()
+-    CLEANUP_INTERVAL = 60.0  # Периодическая сборка мусора каждые 60 секунд для освобождения памяти
+-    # ВАЖНО: При уменьшении количества процессов нужно увеличить аккаунтов на процесс
+-    # 20 процессов × 65 аккаунтов = 1,300 аккаунтов (достаточно для 1,261 аккаунта при полной нагрузке)
+-    # Каждый процесс обрабатывает ~65 аккаунтов, что дает интервал опроса ~5-6 секунд
+-    # При 20 процессах: 20 × 10 аккаунтов/5сек = 40 аккаунтов/сек
+-    # Для 1,261 аккаунта: 1,261 / 40 = ~32 секунды на полный цикл (приемлемо при интервале 5-6 секунд)
+-    MAX_ACCOUNTS_PER_WORKER = 40  # Оптимизировано: 30 процессов × 40 аккаунтов = 1,200 максимум (для равномерного распределения)
+-    
+-    def with_timeout(imap_obj, timeout_val, fn, *args, **kwargs):
++# ВАЖНО: Периодическая очистка памяти (gc.collect) для освобождения памяти от закрытых соединений
++# НЕ удаляем аккаунты вообще - только помечаем как неактивные при ошибках авторизации
++# Аккаунты с ошибками авторизации помечаются как disabled=True и пропускаются при обработке
++last_cleanup_time = time.time()
++CLEANUP_INTERVAL = 60.0  # Периодическая сборка мусора каждые 60 секунд для освобождения памяти
++# ВАЖНО: При уменьшении количества процессов нужно увеличить аккаунтов на процесс
++# 20 процессов × 65 аккаунтов = 1,300 аккаунтов (достаточно для 1,261 аккаунта при полной нагрузке)
++# Каждый процесс обрабатывает ~65 аккаунтов, что дает интервал опроса ~5-6 секунд
++# При 20 процессах: 20 × 10 аккаунтов/5сек = 40 аккаунтов/сек
++# Для 1,261 аккаунта: 1,261 / 40 = ~32 секунды на полный цикл (приемлемо при интервале 5-6 секунд)
++MAX_ACCOUNTS_PER_WORKER = 40  # Оптимизировано: 30 процессов × 40 аккаунтов = 1,200 максимум (для равномерного распределения)
++
++def with_timeout(imap_obj, timeout_val, fn, *args, **kwargs):
+         """
+         Helper для выполнения IMAP операций с socket-level таймаутом.
+         ВАЖНО: устанавливает таймаут на уровне сокета, чтобы предотвратить "залипшие" соединения.
+@@ -8673,8 +8659,9 @@ def _imap_worker_pool_worker(account_queue: Queue, result_queue: Queue, stop_eve
+         else:
+             # Если сокета нет, выполняем операцию без таймаута (но это не должно происходить)
+             return fn(*args, **kwargs)
+-    
+-    def connect_imap_for_account(config: ImapAccountConfig) -> Tuple[bool, Optional[imaplib.IMAP4], Optional[str], str]:
++
++
++def connect_imap_for_account(config: ImapAccountConfig) -> Tuple[bool, Optional[imaplib.IMAP4], Optional[str], str]:
+         """
+         Подключение к IMAP через прокси с таймаутами для аккаунта.
+         Возвращает (success, imap_obj, error_type, error_msg)
+@@ -8794,304 +8781,45 @@ def _imap_worker_pool_worker(account_queue: Queue, result_queue: Queue, stop_eve
+                 return False, None, "auth_error", f"{type(e).__name__}: {str(e)}"
+             else:
+                 return False, None, "temp_error", f"{type(e).__name__}: {str(e)}"
++
++
++def check_connection(imap_obj) -> bool:
++    """Проверка живости соединения через NOOP"""
++    if not imap_obj:
++        return False
++    try:
++        typ, _ = with_timeout(imap_obj, noop_timeout, imap_obj.noop)
++        return str(typ).upper() == "OK"
++    except:
++        return False
++
++
++def fetch_new_messages(imap_obj, config: ImapAccountConfig) -> Tuple[int, list, Optional[str]]:
++    """
++    Получение новых сообщений для аккаунта.
++    Возвращает (count, messages, error_type)
++    """
++    if not imap_obj:
++        return -1, [], "auth_error"
+     
+-    def check_connection(imap_obj) -> bool:
+-        """Проверка живости соединения через NOOP"""
+-        if not imap_obj:
+-            return False
+-        try:
+-            typ, _ = with_timeout(imap_obj, noop_timeout, imap_obj.noop)
+-            return str(typ).upper() == "OK"
+-        except:
+-            return False
+-    
+-    def fetch_new_messages(imap_obj, config: ImapAccountConfig) -> Tuple[int, list, Optional[str]]:
+-        """
+-        Получение новых сообщений для аккаунта.
+-        Возвращает (count, messages, error_type)
+-        """
+-        if not imap_obj:
+-            return -1, [], "auth_error"
++    try:
++        # Проверка соединения
++        if not check_connection(imap_obj):
++            return -2, [], "temp_error"
+         
++        # Поиск непрочитанных
+         try:
+-            # Проверка соединения
+-            if not check_connection(imap_obj):
+-                return -2, [], "temp_error"
++            typ, data = with_timeout(imap_obj, read_timeout, imap_obj.uid, "search", None, "UNSEEN")
++            search_typ = str(typ).upper()
+             
+-            # Поиск непрочитанных
+-            try:
+-                typ, data = with_timeout(imap_obj, read_timeout, imap_obj.uid, "search", None, "UNSEEN")
+-                search_typ = str(typ).upper()
++            if search_typ != "OK":
++                error_msg = (data[0] if data and len(data) > 0 else b"").decode("utf-8", errors="ignore")
++                error_lower = error_msg.lower()
+                 
+-                if search_typ != "OK":
+-                    error_msg = (data[0] if data and len(data) > 0 else b"").decode("utf-8", errors="ignore")
+-                    error_lower = error_msg.lower()
+-                    
+-                    if any(keyword in error_lower for keyword in ["auth", "invalid", "login", "not authenticated", "not logged in"]):
+-                        return -1, [], "auth_error"
+-                    else:
+-                        return -2, [], "temp_error"
+-            except imaplib.IMAP4.error as e:
+-                error_str = str(e).lower()
+-                if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
++                if any(keyword in error_lower for keyword in ["auth", "invalid", "login", "not authenticated", "not logged in"]):
+                     return -1, [], "auth_error"
+                 else:
+                     return -2, [], "temp_error"
+-            except Exception as e:
+-                error_str = str(e).lower()
+-                if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
+-                    return -1, [], "auth_error"
+-                else:
+-                    return -2, [], "temp_error"
+-            
+-            uid_bytes = (data[0] or b"")
+-            unseen_uids = [u for u in uid_bytes.split() if u]
+-            
+-            if not unseen_uids:
+-                return 0, [], None
+-            
+-            # Получение сообщений
+-            messages = []
+-            for uid in unseen_uids:
+-                try:
+-                    typ, msg_data = with_timeout(imap_obj, read_timeout, imap_obj.uid, "fetch", uid, "(RFC822)")
+-                    if str(typ).upper() != "OK" or not msg_data:
+-                        continue
+-
+-                    # Парсинг сообщения
+-                    part = next((x for x in msg_data if isinstance(x, tuple) and x and isinstance(x[1], (bytes, bytearray))), None)
+-                    if not part:
+-                        continue
+-                    
+-                    import email as _email
+-                    from email.header import decode_header
+-                    
+-                    msg = _email.message_from_bytes(part[1])
+-                    
+-                    # Извлечение данных
+-                    from_email = msg.get("From", "")
+-                    from_name = ""
+-                    subject = ""
+-                    body = ""
+-                    
+-                    # Декодирование заголовков
+-                    def decode_mime_header(s):
+-                        if not s:
+-                            return ""
+-                        decoded_parts = decode_header(s)
+-                        decoded_str = ""
+-                        for part, encoding in decoded_parts:
+-                            if isinstance(part, bytes):
+-                                try:
+-                                    decoded_str += part.decode(encoding or "utf-8", errors="ignore")
+-                                except:
+-                                    decoded_str += part.decode("utf-8", errors="ignore")
+-                            else:
+-                                decoded_str += str(part)
+-                        return decoded_str
+-                    
+-                    from_email = decode_mime_header(from_email)
+-                    subject = decode_mime_header(msg.get("Subject", ""))
+-                    
+-                    # Извлечение тела с обработкой HTML
+-                    text_parts = []
+-                    html_parts = []
+-                    html_raw_parts = []  # Для fallback, если парсер вернет пустую строку
+-                    
+-                    if msg.is_multipart():
+-                        for part in msg.walk():
+-                            content_type = part.get_content_type()
+-                            disp = str(part.get("Content-Disposition") or "")
+-                            if "attachment" in disp.lower():
+-                                continue
+-                            try:
+-                                payload = part.get_payload(decode=True)
+-                                if not payload:
+-                                    continue
+-                                # Пробуем декодировать с различными кодировками
+-                                charset = part.get_content_charset() or "utf-8"
+-                                try:
+-                                    text = payload.decode(charset, errors="replace")
+-                                except (UnicodeDecodeError, LookupError):
+-                                    # Fallback на utf-8, затем latin-1
+-                                    try:
+-                                        text = payload.decode("utf-8", errors="replace")
+-                                    except Exception:
+-                                        text = payload.decode("latin-1", errors="replace")
+-                            except Exception:
+-                                continue
+-                            
+-                            if not text or not text.strip():
+-                                continue
+-                            
+-                            # Обрабатываем разные типы контента
+-                            if content_type == "text/plain":
+-                                text_parts.append(text)
+-                            elif content_type == "text/html":
+-                                # Сохраняем сырой HTML для fallback
+-                                html_raw_parts.append(text)
+-                                # Извлекаем текст из HTML
+-                                html_text = _extract_text_from_html(text)
+-                                if html_text and html_text.strip():
+-                                    html_parts.append(html_text)
+-                            elif content_type.startswith("text/"):
+-                                # Для других текстовых типов (text/rtf, text/enriched и т.д.) пробуем как plain text
+-                                text_parts.append(text)
+-                    else:
+-                        try:
+-                            payload = msg.get_payload(decode=True)
+-                            if payload:
+-                                charset = msg.get_content_charset() or "utf-8"
+-                                try:
+-                                    text = payload.decode(charset, errors="replace")
+-                                except (UnicodeDecodeError, LookupError):
+-                                    try:
+-                                        text = payload.decode("utf-8", errors="replace")
+-                                    except Exception:
+-                                        text = payload.decode("latin-1", errors="replace")
+-                                
+-                                content_type = msg.get_content_type()
+-                                if content_type == "text/plain":
+-                                    if text and text.strip():
+-                                        text_parts.append(text)
+-                                elif content_type == "text/html":
+-                                    if text and text.strip():
+-                                        html_raw_parts.append(text)
+-                                        html_text = _extract_text_from_html(text)
+-                                        if html_text and html_text.strip():
+-                                            html_parts.append(html_text)
+-                                else:
+-                                    # Если неизвестный тип, пробуем как текст
+-                                    if text and text.strip():
+-                                        text_parts.append(text)
+-                        except Exception:
+-                            pass
+-                    
+-                    # Используем plain text если есть, иначе HTML
+-                    if text_parts:
+-                        body = "\n".join(text_parts)
+-                    elif html_parts:
+-                        body = "\n".join(html_parts)
+-                    elif html_raw_parts:
+-                        # Fallback: если парсер HTML вернул пустую строку, используем простую обработку
+-                        # html_unescape уже импортирован в начале функции
+-                        fallback_texts = []
+-                        for raw_html in html_raw_parts:
+-                            try:
+-                                # Простое удаление тегов и декодирование entities (сохраняем структуру)
+-                                simple_text = html_unescape(raw_html)
+-                                # Заменяем блочные элементы на переносы строк перед удалением тегов
+-                                simple_text = re.sub(r'</?(?:div|p|br|li|tr|td|th)[^>]*>', '\n', simple_text, flags=re.IGNORECASE)
+-                                simple_text = re.sub(r'<[^>]+>', ' ', simple_text)
+-                                # Обрабатываем entities
+-                                simple_text = re.sub(r'&nbsp;', ' ', simple_text)
+-                                simple_text = re.sub(r'&amp;', '&', simple_text)
+-                                simple_text = re.sub(r'&lt;', '<', simple_text)
+-                                simple_text = re.sub(r'&gt;', '>', simple_text)
+-                                # Нормализуем пробелы, но сохраняем переносы строк
+-                                simple_text = re.sub(r'[ \t]+', ' ', simple_text)  # Только пробелы и табы
+-                                simple_text = re.sub(r'[ \t]*\n[ \t]*', '\n', simple_text)  # Пробелы вокруг переносов
+-                                simple_text = re.sub(r'\n{3,}', '\n\n', simple_text)  # Максимум 2 переноса подряд
+-                                # Убираем пробелы в конце строк, но сохраняем структуру
+-                                lines = simple_text.split('\n')
+-                                simple_text = '\n'.join(line.rstrip() for line in lines)
+-                                if simple_text.strip():
+-                                    fallback_texts.append(simple_text.strip())
+-                            except Exception:
+-                                pass
+-                        body = "\n\n".join(fallback_texts) if fallback_texts else ""
+-                    else:
+-                        body = ""
+-                    
+-                    # Минимальная очистка: удаляем только избыточные пустые строки (сохраняем структуру)
+-                    if body:
+-                        # Убираем пробелы в конце строк, но сохраняем переносы
+-                        lines = body.split('\n')
+-                        body = '\n'.join(line.rstrip() for line in lines)
+-                        # Удаляем только избыточные пустые строки (более 2 подряд)
+-                        body = re.sub(r'\n{3,}', '\n\n', body)
+-                        # Убираем пробелы только в начале и конце всего текста
+-                        body = body.strip()
+-                    
+-                    # Логирование для диагностики пустых тел (только если body пустое, но subject есть)
+-                    if not body and subject:
+-                        import logging
+-                        logging.warning(
+-                            f"IMAP: пустое тело письма от {from_email}, subject={subject[:50]}, "
+-                            f"text_parts={len(text_parts)}, html_parts={len(html_parts)}, "
+-                            f"html_raw_parts={len(html_raw_parts)}"
+-                        )
+-                    
+-                    # Парсинг From
+-                    try:
+-                        from email.utils import parseaddr
+-                        from_name, from_email_addr = parseaddr(from_email)
+-                        if from_email_addr:
+-                            from_email = from_email_addr
+-                    except:
+-                        pass
+-                    
+-                    # ВАЖНО: Проверка автоматических отправителей (no-reply@accounts.google.com, noreply@google.com)
+-                    # Письма от этих отправителей помечаются как прочитанные, но не публикуются
+-                    from_email_lower = from_email.lower().strip() if from_email else ""
+-                    automated_senders = [
+-                        "no-reply@accounts.google.com",
+-                        "noreply@google.com",
+-                        "noreply@accounts.google.com",
+-                        "no-reply@google.com",
+-                    ]
+-                    is_automated = from_email_lower in automated_senders
+-                    
+-                    # Помечаем как прочитанное (всегда, даже для автоматических отправителей)
+-                    try:
+-                        with_timeout(imap_obj, write_timeout, imap_obj.uid, "store", uid, "+FLAGS", r"(\Seen)")
+-                    except:
+-                        pass
+-                    
+-                    # Если это автоматический отправитель, не добавляем в список для публикации
+-                    if is_automated:
+-                        continue
+-                    
+-                    # ВАЖНО: Ограничиваем размер body для экономии памяти при полной нагрузке
+-                    # Ограничиваем до 5000 символов (достаточно для большинства писем)
+-                    MAX_BODY_SIZE = 5000
+-                    if body and len(body) > MAX_BODY_SIZE:
+-                        body = body[:MAX_BODY_SIZE] + "\n\n[... сообщение обрезано ...]"
+-                    
+-                    # Ограничиваем размер subject
+-                    MAX_SUBJECT_SIZE = 500
+-                    if subject and len(subject) > MAX_SUBJECT_SIZE:
+-                        subject = subject[:MAX_SUBJECT_SIZE] + "..."
+-                    
+-                    messages.append({
+-                        "uid": uid.decode("utf-8", errors="ignore") if isinstance(uid, bytes) else str(uid),
+-                        "from_email": from_email,
+-                        "from_name": from_name,
+-                        "subject": subject,
+-                        "body": body,
+-                    })
+-                    
+-                    # ВАЖНО: Очищаем локальные переменные для экономии памяти
+-                    # (переменные будут очищены автоматически после выхода из цикла)
+-                        
+-                except Exception as e:
+-                    continue
+-
+-            # ВАЖНО: Ограничиваем количество сообщений за один опрос для экономии памяти
+-            # Если сообщений слишком много, возвращаем только первые (остальные будут обработаны при следующем опросе)
+-            MAX_MESSAGES_PER_POLL = 50
+-            if len(messages) > MAX_MESSAGES_PER_POLL:
+-                # Логируем, что сообщения обрезаны
+-                import sys
+-                import os as _os_worker
+-                try:
+-                    print(f"[WORKER {_os_worker.getpid()}] Too many messages ({len(messages)}), limiting to {MAX_MESSAGES_PER_POLL}", file=sys.stderr, flush=True)
+-                except:
+-                    pass
+-                messages = messages[:MAX_MESSAGES_PER_POLL]
+-            
+-            return len(messages), messages, None
+-            
+         except imaplib.IMAP4.error as e:
+             error_str = str(e).lower()
+             if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
+@@ -9104,47 +8832,309 @@ def _imap_worker_pool_worker(account_queue: Queue, result_queue: Queue, stop_eve
+                 return -1, [], "auth_error"
+             else:
+                 return -2, [], "temp_error"
+-    
+-    # Основной цикл воркера
+-    while not stop_event.is_set():
+-        try:
+-            now = _time.time()
+-            
+-            # ВАЖНО: Периодическая очистка памяти (gc.collect) для освобождения памяти от закрытых соединений
+-            # НЕ удаляем аккаунты вообще - только помечаем как неактивные при ошибках авторизации
+-            # Аккаунты с ошибками авторизации помечаются как disabled=True и пропускаются при обработке
+-            if now - last_cleanup_time >= CLEANUP_INTERVAL:
+-                last_cleanup_time = now
++        
++        uid_bytes = (data[0] or b"")
++        unseen_uids = [u for u in uid_bytes.split() if u]
++        
++        if not unseen_uids:
++            return 0, [], None
++        
++        # Получение сообщений
++        messages = []
++        for uid in unseen_uids:
++            try:
++                typ, msg_data = with_timeout(imap_obj, read_timeout, imap_obj.uid, "fetch", uid, "(RFC822)")
++                if str(typ).upper() != "OK" or not msg_data:
++                    continue
++
++                # Парсинг сообщения
++                part = next((x for x in msg_data if isinstance(x, tuple) and x and isinstance(x[1], (bytes, bytearray))), None)
++                if not part:
++                    continue
+                 
+-                # ВАЖНО: Принудительная сборка мусора для освобождения памяти
+-                # Это освобождает память от закрытых соединений и других объектов
+-                import gc
+-                gc.collect()
++                import email as _email
++                from email.header import decode_header
+                 
+-                # Подсчитываем статистику аккаунтов
+-                total_accounts = len(account_states)
+-                active_accounts = sum(1 for state in account_states.values() if not state.get("disabled", False) and not state.get("auth_error", False))
+-                disabled_accounts = sum(1 for state in account_states.values() if state.get("disabled", False) or state.get("auth_error", False))
+-                connected_accounts = sum(1 for state in account_states.values() if state.get("imap") is not None)
++                msg = _email.message_from_bytes(part[1])
+                 
+-                import sys
+-                import os as _os_worker
+-                try:
+-                    if total_accounts > 0:
+-                        print(f"[WORKER {_os_worker.getpid()}] Accounts: total={total_accounts} active={active_accounts} disabled={disabled_accounts} connected={connected_accounts}", file=sys.stderr, flush=True)
+-                    # Логируем только если есть аккаунты, чтобы не засорять логи
+-                except:
+-                    pass
+-            
+-            # Получаем новые аккаунты из очереди (неблокирующе)
+-            # ВАЖНО: используем get_nowait() с обработкой исключений, чтобы не блокироваться
+-            # ВАЖНО: Обрабатываем до 50 аккаунтов за итерацию, чтобы не блокировать обработку существующих аккаунтов
+-            new_accounts_count = 0
+-            max_new_accounts_per_iteration = 50
+-            try:
+-                while new_accounts_count < max_new_accounts_per_iteration:
+-                    try:
+-                        config_dict = account_queue.get_nowait()
++                # Извлечение данных
++                from_email = msg.get("From", "")
++                from_name = ""
++                subject = ""
++                body = ""
++                
++                # Декодирование заголовков
++                def decode_mime_header(s):
++                    if not s:
++                        return ""
++                    decoded_parts = decode_header(s)
++                    decoded_str = ""
++                    for part, encoding in decoded_parts:
++                        if isinstance(part, bytes):
++                            try:
++                                decoded_str += part.decode(encoding or "utf-8", errors="ignore")
++                            except:
++                                decoded_str += part.decode("utf-8", errors="ignore")
++                        else:
++                            decoded_str += str(part)
++                    return decoded_str
++                
++                from_email = decode_mime_header(from_email)
++                subject = decode_mime_header(msg.get("Subject", ""))
++                
++                # Извлечение тела с обработкой HTML
++                text_parts = []
++                html_parts = []
++                html_raw_parts = []  # Для fallback, если парсер вернет пустую строку
++                
++                if msg.is_multipart():
++                    for part in msg.walk():
++                        content_type = part.get_content_type()
++                        disp = str(part.get("Content-Disposition") or "")
++                        if "attachment" in disp.lower():
++                            continue
++                        try:
++                            payload = part.get_payload(decode=True)
++                            if not payload:
++                                continue
++                            # Пробуем декодировать с различными кодировками
++                            charset = part.get_content_charset() or "utf-8"
++                            try:
++                                text = payload.decode(charset, errors="replace")
++                            except (UnicodeDecodeError, LookupError):
++                                # Fallback на utf-8, затем latin-1
++                                try:
++                                    text = payload.decode("utf-8", errors="replace")
++                                except Exception:
++                                    text = payload.decode("latin-1", errors="replace")
++                        except Exception:
++                            continue
++                        
++                        if not text or not text.strip():
++                            continue
++                        
++                        # Обрабатываем разные типы контента
++                        if content_type == "text/plain":
++                            text_parts.append(text)
++                        elif content_type == "text/html":
++                            # Сохраняем сырой HTML для fallback
++                            html_raw_parts.append(text)
++                            # Извлекаем текст из HTML
++                            html_text = _extract_text_from_html(text)
++                            if html_text and html_text.strip():
++                                html_parts.append(html_text)
++                        elif content_type.startswith("text/"):
++                            # Для других текстовых типов (text/rtf, text/enriched и т.д.) пробуем как plain text
++                            text_parts.append(text)
++                else:
++                    try:
++                        payload = msg.get_payload(decode=True)
++                        if payload:
++                            charset = msg.get_content_charset() or "utf-8"
++                            try:
++                                text = payload.decode(charset, errors="replace")
++                            except (UnicodeDecodeError, LookupError):
++                                try:
++                                    text = payload.decode("utf-8", errors="replace")
++                                except Exception:
++                                    text = payload.decode("latin-1", errors="replace")
++                            
++                            content_type = msg.get_content_type()
++                            if content_type == "text/plain":
++                                if text and text.strip():
++                                    text_parts.append(text)
++                            elif content_type == "text/html":
++                                if text and text.strip():
++                                    html_raw_parts.append(text)
++                                    html_text = _extract_text_from_html(text)
++                                    if html_text and html_text.strip():
++                                        html_parts.append(html_text)
++                            else:
++                                # Если неизвестный тип, пробуем как текст
++                                if text and text.strip():
++                                    text_parts.append(text)
++                    except Exception:
++                        pass
++                
++                # Используем plain text если есть, иначе HTML
++                if text_parts:
++                    body = "\n".join(text_parts)
++                elif html_parts:
++                    body = "\n".join(html_parts)
++                elif html_raw_parts:
++                    # Fallback: если парсер HTML вернул пустую строку, используем простую обработку
++                    # html_unescape уже импортирован в начале функции
++                    fallback_texts = []
++                    for raw_html in html_raw_parts:
++                        try:
++                            # Простое удаление тегов и декодирование entities (сохраняем структуру)
++                            simple_text = html_unescape(raw_html)
++                            # Заменяем блочные элементы на переносы строк перед удалением тегов
++                            simple_text = re.sub(r'</?(?:div|p|br|li|tr|td|th)[^>]*>', '\n', simple_text, flags=re.IGNORECASE)
++                            simple_text = re.sub(r'<[^>]+>', ' ', simple_text)
++                            # Обрабатываем entities
++                            simple_text = re.sub(r'&nbsp;', ' ', simple_text)
++                            simple_text = re.sub(r'&amp;', '&', simple_text)
++                            simple_text = re.sub(r'&lt;', '<', simple_text)
++                            simple_text = re.sub(r'&gt;', '>', simple_text)
++                            # Нормализуем пробелы, но сохраняем переносы строк
++                            simple_text = re.sub(r'[ \t]+', ' ', simple_text)  # Только пробелы и табы
++                            simple_text = re.sub(r'[ \t]*\n[ \t]*', '\n', simple_text)  # Пробелы вокруг переносов
++                            simple_text = re.sub(r'\n{3,}', '\n\n', simple_text)  # Максимум 2 переноса подряд
++                            # Убираем пробелы в конце строк, но сохраняем структуру
++                            lines = simple_text.split('\n')
++                            simple_text = '\n'.join(line.rstrip() for line in lines)
++                            if simple_text.strip():
++                                fallback_texts.append(simple_text.strip())
++                        except Exception:
++                            pass
++                    body = "\n\n".join(fallback_texts) if fallback_texts else ""
++                else:
++                    body = ""
++                
++                # Минимальная очистка: удаляем только избыточные пустые строки (сохраняем структуру)
++                if body:
++                    # Убираем пробелы в конце строк, но сохраняем переносы
++                    lines = body.split('\n')
++                    body = '\n'.join(line.rstrip() for line in lines)
++                    # Удаляем только избыточные пустые строки (более 2 подряд)
++                    body = re.sub(r'\n{3,}', '\n\n', body)
++                    # Убираем пробелы только в начале и конце всего текста
++                    body = body.strip()
++                
++                # Логирование для диагностики пустых тел (только если body пустое, но subject есть)
++                if not body and subject:
++                    import logging
++                    logging.warning(
++                        f"IMAP: пустое тело письма от {from_email}, subject={subject[:50]}, "
++                        f"text_parts={len(text_parts)}, html_parts={len(html_parts)}, "
++                        f"html_raw_parts={len(html_raw_parts)}"
++                    )
++                
++                # Парсинг From
++                try:
++                    from email.utils import parseaddr
++                    from_name, from_email_addr = parseaddr(from_email)
++                    if from_email_addr:
++                        from_email = from_email_addr
++                except:
++                    pass
++                
++                # ВАЖНО: Проверка автоматических отправителей (no-reply@accounts.google.com, noreply@google.com)
++                # Письма от этих отправителей помечаются как прочитанные, но не публикуются
++                from_email_lower = from_email.lower().strip() if from_email else ""
++                automated_senders = [
++                    "no-reply@accounts.google.com",
++                    "noreply@google.com",
++                    "noreply@accounts.google.com",
++                    "no-reply@google.com",
++                ]
++                is_automated = from_email_lower in automated_senders
++                
++                # Помечаем как прочитанное (всегда, даже для автоматических отправителей)
++                try:
++                    with_timeout(imap_obj, write_timeout, imap_obj.uid, "store", uid, "+FLAGS", r"(\Seen)")
++                except:
++                    pass
++                
++                # Если это автоматический отправитель, не добавляем в список для публикации
++                if is_automated:
++                    continue
++                
++                # ВАЖНО: Ограничиваем размер body для экономии памяти при полной нагрузке
++                # Ограничиваем до 5000 символов (достаточно для большинства писем)
++                MAX_BODY_SIZE = 5000
++                if body and len(body) > MAX_BODY_SIZE:
++                    body = body[:MAX_BODY_SIZE] + "\n\n[... сообщение обрезано ...]"
++                
++                # Ограничиваем размер subject
++                MAX_SUBJECT_SIZE = 500
++                if subject and len(subject) > MAX_SUBJECT_SIZE:
++                    subject = subject[:MAX_SUBJECT_SIZE] + "..."
++                
++                messages.append({
++                    "uid": uid.decode("utf-8", errors="ignore") if isinstance(uid, bytes) else str(uid),
++                    "from_email": from_email,
++                    "from_name": from_name,
++                    "subject": subject,
++                    "body": body,
++                })
++                
++                # ВАЖНО: Очищаем локальные переменные для экономии памяти
++                # (переменные будут очищены автоматически после выхода из цикла)
++                        
++            except Exception as e:
++                continue
++
++        # ВАЖНО: Ограничиваем количество сообщений за один опрос для экономии памяти
++        # Если сообщений слишком много, возвращаем только первые (остальные будут обработаны при следующем опросе)
++        MAX_MESSAGES_PER_POLL = 50
++        if len(messages) > MAX_MESSAGES_PER_POLL:
++            # Логируем, что сообщения обрезаны
++            import sys
++            import os as _os_worker
++            try:
++                print(f"[WORKER {_os_worker.getpid()}] Too many messages ({len(messages)}), limiting to {MAX_MESSAGES_PER_POLL}", file=sys.stderr, flush=True)
++            except:
++                pass
++            messages = messages[:MAX_MESSAGES_PER_POLL]
++        
++        return len(messages), messages, None
++        
++    except imaplib.IMAP4.error as e:
++        error_str = str(e).lower()
++        if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
++            return -1, [], "auth_error"
++        else:
++            return -2, [], "temp_error"
++    except Exception as e:
++        error_str = str(e).lower()
++        if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
++            return -1, [], "auth_error"
++        else:
++            return -2, [], "temp_error"
++
++
++# Основной цикл воркера
++    while not stop_event.is_set():
++        try:
++            now = _time.time()
++            
++            # ВАЖНО: Периодическая очистка памяти (gc.collect) для освобождения памяти от закрытых соединений
++            # НЕ удаляем аккаунты вообще - только помечаем как неактивные при ошибках авторизации
++            # Аккаунты с ошибками авторизации помечаются как disabled=True и пропускаются при обработке
++            if now - last_cleanup_time >= CLEANUP_INTERVAL:
++                last_cleanup_time = now
++                
++                # ВАЖНО: Принудительная сборка мусора для освобождения памяти
++                # Это освобождает память от закрытых соединений и других объектов
++                import gc
++                gc.collect()
++                
++                # Подсчитываем статистику аккаунтов
++                total_accounts = len(account_states)
++                active_accounts = sum(1 for state in account_states.values() if not state.get("disabled", False) and not state.get("auth_error", False))
++                disabled_accounts = sum(1 for state in account_states.values() if state.get("disabled", False) or state.get("auth_error", False))
++                connected_accounts = sum(1 for state in account_states.values() if state.get("imap") is not None)
++                
++                import sys
++                import os as _os_worker
++                try:
++                    if total_accounts > 0:
++                        print(f"[WORKER {_os_worker.getpid()}] Accounts: total={total_accounts} active={active_accounts} disabled={disabled_accounts} connected={connected_accounts}", file=sys.stderr, flush=True)
++                    # Логируем только если есть аккаунты, чтобы не засорять логи
++                except:
++                    pass
++            
++            # Получаем новые аккаунты из очереди (неблокирующе)
++            # ВАЖНО: используем get_nowait() с обработкой исключений, чтобы не блокироваться
++            # ВАЖНО: Обрабатываем до 50 аккаунтов за итерацию, чтобы не блокировать обработку существующих аккаунтов
++            new_accounts_count = 0
++            max_new_accounts_per_iteration = 50
++            try:
++                while new_accounts_count < max_new_accounts_per_iteration:
++                    try:
++                        config_dict = account_queue.get_nowait()
+                         if config_dict is None:  # Сигнал остановки
+                             break
+                         # Десериализуем конфигурацию
+@@ -9288,9 +9278,9 @@ def _imap_worker_pool_worker(account_queue: Queue, result_queue: Queue, stop_eve
+                 # Это предотвращает зависание чтения, когда операция зависает на уровне сокета
+                 # Проверяем ДО вызова fetch_new_messages, чтобы обнаружить зависание предыдущей операции
+                 last_poll = state.get("last_poll_time", 0.0)
+-                # Уменьшаем max_stall_time до 20 секунд для более быстрого обнаружения зависаний
+-                # Это предотвращает долгие зависания операций
+-                max_stall_time = 20.0  # 20 секунд - более агрессивный таймаут для обнаружения зависаний
++                # Таймаут ожидания завершения fetch: если предыдущий опрос длился слишком долго, переподключаемся.
++                # 45 секунд — компромисс между чувствительностью к зависаниям и избежанием ложных срабатываний
++                max_stall_time = 45.0
+                 if last_poll > 0.0 and (now - last_poll) > max_stall_time:
+                     # Аккаунт завис - принудительно переподключаем
+                     import sys
+@@ -9326,7 +9316,7 @@ def _imap_worker_pool_worker(account_queue: Queue, result_queue: Queue, stop_eve
+                 # ВАЖНО: Оборачиваем fetch_new_messages в таймаут на уровне threading, чтобы принудительно прервать зависшие операции
+                 # Используем более агрессивный таймаут: 30 секунд (вместо 60)
+                 # Потоки создаются как daemon и автоматически завершаются, не создавая утечек памяти
+-                fetch_timeout = 15.0  # Уменьшено до 15 секунд для более быстрого прерывания зависших операций
++                fetch_timeout = 25.0  # 25 секунд — даем IMAP чуть больше времени, чтобы догрузить крупные письма
+                 count = -2
+                 messages = []
+                 error_type = "temp_error"
+@@ -9554,697 +9544,7 @@ def _imap_worker_pool_worker(account_queue: Queue, result_queue: Queue, stop_eve
+                 except Exception:
+                     pass
+ 
+-def _cleanup_dead_workers():
+-    """
+-    Очищает список IMAP_WORKER_PROCESSES от мертвых процессов.
+-    Возвращает количество удаленных мертвых процессов.
+-    """
+-    global IMAP_WORKER_PROCESSES
+-    if not IMAP_WORKER_PROCESSES:
+-        return 0
+-    
+-    alive_processes = []
+-    dead_count = 0
+-    
+-    for proc in IMAP_WORKER_PROCESSES:
+-        try:
+-            if proc.is_alive():
+-                alive_processes.append(proc)
+-            else:
+-                # Процесс мертв - пытаемся его почистить
+-                try:
+-                    proc.join(timeout=0.1)
+-                except Exception:
+-                    pass
+-                dead_count += 1
+-        except Exception:
+-            # Если не можем проверить статус - считаем мертвым
+-            dead_count += 1
+-    
+-    IMAP_WORKER_PROCESSES = alive_processes
+-    return dead_count
+ 
+-def init_imap_worker_pool() -> bool:
+-    """
+-    Инициализация пула процессов IMAP-воркеров.
+-    Идемпотентно: повторный вызов не создаёт дубликаты, при необходимости сперва останавливает старый пул.
+-    """
+-    import multiprocessing as _mp
+-    global IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_PROCESSES, IMAP_WORKER_STOP_EVENT, IMAP_MP_CONTEXT
+-
+-    # Если уже живы — ничего не делаем
+-    if IMAP_WORKER_PROCESSES and all(p.is_alive() for p in IMAP_WORKER_PROCESSES):
+-        return True
+-
+-    # Попытка мягко закрыть прежние ресурсы
+-    try:
+-        shutdown_imap_worker_pool()
+-    except Exception:
+-        pass
+-
+-    ctx = _mp.get_context("spawn")  # Ubuntu 24.04 — безопасно
+-    IMAP_MP_CONTEXT = ctx  # Сохраняем контекст для использования в watchdog
+-    IMAP_ACCOUNT_QUEUE = ctx.Queue(maxsize=IMAP_ACCOUNT_QUEUE_MAXSIZE)
+-    IMAP_RESULT_QUEUE  = ctx.Queue(maxsize=IMAP_RESULT_QUEUE_MAXSIZE)
+-    IMAP_WORKER_STOP_EVENT = ctx.Event()
+-    IMAP_WORKER_PROCESSES = []
+-
+-    for i in range(int(IMAP_PROCESS_POOL_SIZE)):
+-        p = ctx.Process(
+-            target=_imap_worker_pool_worker,
+-            args=(
+-                IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_STOP_EVENT,
+-                IMAP_POLL_INTERVAL_MIN, IMAP_POLL_INTERVAL_MAX,
+-                IMAP_CONNECTION_TIMEOUT, IMAP_READ_TIMEOUT, IMAP_WRITE_TIMEOUT,
+-                IMAP_NOOP_TIMEOUT, IMAP_RECONNECT_DELAY, IMAP_MAX_RECONNECT_ATTEMPTS, IMAP_PORT_SSL
+-            ),
+-            name=f"imap-worker-{i}",
+-            daemon=True,
+-        )
+-        p.start()
+-        IMAP_WORKER_PROCESSES.append(p)
+-
+-    return True
+-
+-
+-def shutdown_imap_worker_pool():
+-    """
+-    Остановка пула IMAP-воркеров и освобождение очередей.
+-    """
+-    import time as _time
+-    global IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_PROCESSES, IMAP_WORKER_STOP_EVENT
+-
+-    # Сигнал остановки
+-    try:
+-        if IMAP_WORKER_STOP_EVENT is not None:
+-            IMAP_WORKER_STOP_EVENT.set()
+-    except Exception:
+-        pass
+-
+-    # Дать время корректному завершению
+-    for p in (IMAP_WORKER_PROCESSES or []):
+-        try:
+-            p.join(timeout=1.5)
+-        except Exception:
+-            pass
+-
+-    # Принудительное завершение «висящих»
+-    for p in (IMAP_WORKER_PROCESSES or []):
+-        try:
+-            if p.is_alive():
+-                p.terminate()
+-        except Exception:
+-            pass
+-        try:
+-            if p.is_alive():
+-                p.kill()
+-        except Exception:
+-            pass
+-
+-    IMAP_WORKER_PROCESSES = []
+-
+-    # Закрыть очереди
+-    try:
+-        if IMAP_ACCOUNT_QUEUE is not None:
+-            try:
+-                IMAP_ACCOUNT_QUEUE.close()
+-            except Exception:
+-                pass
+-            IMAP_ACCOUNT_QUEUE = None
+-    except Exception:
+-        pass
+-
+-    try:
+-        if IMAP_RESULT_QUEUE is not None:
+-            try:
+-                IMAP_RESULT_QUEUE.close()
+-            except Exception:
+-                pass
+-            IMAP_RESULT_QUEUE = None
+-    except Exception:
+-        pass
+-
+-    IMAP_WORKER_STOP_EVENT = None
+-    IMAP_MP_CONTEXT = None
+-    _time.sleep(0.1)
+-
+-
+-# УДАЛЕНО: Старая функция _imap_process_worker - полностью удалена
+-# Используется только новая архитектура с _imap_worker_pool_worker
+-
+-async def start_imap_process(user_id: int, acc_id: int, email: str, password: str, display_name: str, chat_id: int, proxy: Optional[Dict[str, Any]] = None) -> bool:
+-    """
+-    Добавление аккаунта в очередь для обработки воркерами пула.
+-    ТРЕБУЕТСЯ: proxy должен быть не None и содержать 'host' и 'port'.
+-    Без прокси аккаунт не добавляется в очередь (SocksIMAP4SSL требует прокси).
+-    
+-    ВАЖНО: Новая архитектура с пулом воркеров
+-    - Инициализирует пул воркеров при первом вызове (если еще не инициализирован)
+-    - Добавляет аккаунт в очередь для обработки воркерами
+-    - Воркеры обрабатывают аккаунты из очереди по очереди (IMAP loop)
+-    - Это позволяет обрабатывать ~650-1261 аккаунтов с ограниченным количеством процессов (150)
+-    """
+-    
+-    key = (user_id, acc_id)
+-    
+-    # Инициализация пула воркеров при первом вызове
+-    if IMAP_ACCOUNT_QUEUE is None:
+-        if not init_imap_worker_pool():
+-            log_send_event(f"IMAP: Failed to initialize worker pool for uid={user_id} acc_id={acc_id}")
+-            return False
+-    
+-    # Проверка, не добавлен ли уже аккаунт в обработку
+-    if key in IMAP_ACCOUNT_STATUS:
+-        status = IMAP_ACCOUNT_STATUS[key]
+-        if status.get("active", False):
+-            return True  # Аккаунт уже в обработке
+-    
+-    # ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА ПРОКСИ: без прокси аккаунт не добавляется в очередь
+-    if not proxy:
+-        log_send_event(f"IMAP: Cannot add account to queue uid={user_id} acc_id={acc_id} email={email}: proxy is required but not provided")
+-        return False
+-    
+-    # Проверка наличия обязательных полей прокси
+-    if not isinstance(proxy, dict):
+-        log_send_event(f"IMAP: Cannot add account to queue uid={user_id} acc_id={acc_id} email={email}: proxy must be a dict, got {type(proxy)}")
+-        return False
+-    
+-    if "host" not in proxy or "port" not in proxy:
+-        log_send_event(f"IMAP: Cannot add account to queue uid={user_id} acc_id={acc_id} email={email}: proxy must contain 'host' and 'port' keys")
+-        return False
+-    
+-    if not proxy.get("host") or not proxy.get("port"):
+-        log_send_event(f"IMAP: Cannot add account to queue uid={user_id} acc_id={acc_id} email={email}: proxy 'host' and 'port' must not be empty")
+-        return False
+-    
+-    # Определение IMAP хоста
+-    host = resolve_imap_host(email)
+-    
+-    # Создание конфигурации
+-    config = ImapAccountConfig(
+-        user_id=user_id,
+-        acc_id=acc_id,
+-        email=email,
+-        password=password,
+-        display_name=display_name,
+-        chat_id=chat_id,
+-        host=host,
+-        proxy=proxy
+-    )
+-    
+-    # Сохранение прокси в account_status для последующего использования в SMTP
+-    if proxy:
+-        # ВАЖНО: Новая архитектура - прокси сохраняется в кэше для быстрого доступа
+-        # Старая логика с UserImapStatus удалена
+-        try:
+-            # Прокси сохраняется в start_imap_process через st.account_status["_proxy_map"]
+-            # Здесь просто логируем для совместимости
+-            pass
+-        except Exception as e:
+-            log_send_event(f"Failed to save proxy for uid={user_id} email={email}: {e}")
+-    
+-    # Добавление аккаунта в очередь для обработки воркерами
+-    # ВАЖНО: используем put_nowait, чтобы не блокироваться
+-    try:
+-        config_dict = config.to_dict()
+-        try:
+-            IMAP_ACCOUNT_QUEUE.put_nowait(config_dict)
+-            log_send_event(f"IMAP: Account added to queue uid={user_id} acc_id={acc_id} email={email} queue_size={IMAP_ACCOUNT_QUEUE.qsize()}")
+-        except Exception as e:
+-            log_send_event(f"IMAP: Queue full or error adding account uid={user_id} acc_id={acc_id} email={email}: {e}")
+-            return False
+-        
+-        # Обновление статуса аккаунта
+-        IMAP_ACCOUNT_STATUS[key] = {
+-            "active": True,
+-            "added_at": time.time()
+-        }
+-        
+-        # ВАЖНО: Обновляем UserImapStatus для совместимости с /read и /status командами
+-        # Это нужно для правильного отображения статуса в командах /read и /status
+-        try:
+-            st = ensure_user_imap_status(user_id)
+-            async with st.lock:
+-                st.running = True
+-                # Получаем объект аккаунта для добавления в st.accounts
+-                accounts = await list_accounts_async(user_id)
+-                acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+-                if acc:
+-                    # Обновляем st.accounts - это нужно для _runtime_is_active
+-                    if not hasattr(st, "accounts"):
+-                        st.accounts = {}
+-                    st.accounts[email] = acc
+-                    # Обновляем st.account_status для совместимости
+-                    st.account_status.setdefault(email, {})
+-                    st.account_status[email]["active"] = True
+-        except Exception as e:
+-            log_send_event(f"IMAP: Failed to update UserImapStatus for uid={user_id} acc_id={acc_id} email={email}: {e}")
+-        
+-        log_send_event(f"IMAP: Account added to queue uid={user_id} acc_id={acc_id} email={email}")
+-        
+-        # ВАЖНО: отправляем уведомление пользователю через дренер логов
+-        try:
+-            schedule_start_log(user_id, chat_id, email)
+-        except Exception as e:
+-            log_send_event(f"IMAP: Failed to schedule start log for uid={user_id} acc_id={acc_id} email={email}: {e}")
+-        
+-        return True
+-    except Exception as e:
+-        log_send_event(f"IMAP: Failed to add account to queue uid={user_id} acc_id={acc_id} email={email}: {e}")
+-        return False
+-
+-async def stop_imap_process(user_id: int, acc_id: int) -> bool:
+-    """
+-    Остановка чтения аккаунта (новая архитектура с пулом воркеров).
+-    ВАЖНО: Аккаунт НЕ удаляется из воркеров - только помечается как неактивный в IMAP_ACCOUNT_STATUS.
+-    Воркеры продолжают хранить аккаунт в account_states, но не обрабатывают его при disabled=True.
+-    При повторном вызове start_imap_process аккаунт снова начнет обрабатываться (флаг disabled сбросится).
+-    """
+-    key = (user_id, acc_id)
+-    
+-    # Помечаем аккаунт как неактивный (не удаляем из воркеров)
+-    if key in IMAP_ACCOUNT_STATUS:
+-        IMAP_ACCOUNT_STATUS[key] = {"active": False}
+-        log_send_event(f"IMAP: Account stopped (marked as inactive) uid={user_id} acc_id={acc_id}")
+-        
+-        # ВАЖНО: Обновляем UserImapStatus для совместимости с /read и /status командами
+-        try:
+-            st = ensure_user_imap_status(user_id)
+-            async with st.lock:
+-                # Получаем email аккаунта для обновления st.account_status
+-                accounts = await list_accounts_async(user_id)
+-                acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+-                if acc:
+-                    email = getattr(acc, "email", "")
+-                    if email:
+-                        # Обновляем st.account_status для совместимости
+-                        st.account_status.setdefault(email, {})
+-                        st.account_status[email]["active"] = False
+-                        # НЕ удаляем из st.accounts - это может использоваться другими частями кода
+-        except Exception as e:
+-            log_send_event(f"IMAP: Failed to update UserImapStatus on stop for uid={user_id} acc_id={acc_id}: {e}")
+-        
+-        return True
+-    
+-    # Если аккаунт не был в статусе, все равно логируем остановку
+-    log_send_event(f"IMAP: Account stop requested (not in queue) uid={user_id} acc_id={acc_id}")
+-    return False
+-
+-async def _process_imap_results_global():
+-    """
+-    Глобальный обработчик результатов из общей очереди результатов всех воркеров.
+-    Обрабатывает результаты от всех аккаунтов.
+-    """
+-    if IMAP_RESULT_QUEUE is None:
+-        return
+-    
+-    while True:
+-        try:
+-            # Получение результата с таймаутом (ВАЖНО: не блокируемся вечно)
+-            try:
+-                result = await asyncio.get_event_loop().run_in_executor(
+-                    None,
+-                    lambda: IMAP_RESULT_QUEUE.get(timeout=1.0)  # Таймаут 1 секунда
+-                )
+-            except Exception:
+-                # Timeout или другая ошибка - продолжаем цикл
+-                await asyncio.sleep(0.5)
+-                continue
+-
+-            # Извлекаем данные из результата
+-            user_id = result.get("user_id")
+-            acc_id = result.get("acc_id")
+-            email = result.get("email")
+-            
+-            if not user_id or not acc_id:
+-                continue
+-
+-            key = (user_id, acc_id)
+-            
+-            # Получаем chat_id из результата (передается из конфигурации аккаунта)
+-            # ВАЖНО: chat_id должен быть в конфигурации аккаунта (ImapAccountConfig.chat_id)
+-            chat_id = result.get("chat_id")
+-            if chat_id:
+-                try:
+-                    chat_id = int(chat_id)
+-                except:
+-                    chat_id = None
+-            
+-            # Если chat_id не найден в результате, пытаемся получить из статуса или аккаунта
+-            if not chat_id:
+-                try:
+-                    st = ensure_user_imap_status(user_id)
+-                    meta = getattr(st, "account_status", {}).get("_meta", {})
+-                    chat_id = meta.get("chat_id")
+-                    if chat_id:
+-                        chat_id = int(chat_id)
+-                except:
+-                    pass
+-            
+-            if not chat_id:
+-                # Если chat_id все еще не найден, пытаемся получить из аккаунта
+-                try:
+-                    accounts = await list_accounts_async(user_id)
+-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+-                    if acc:
+-                        # Если chat_id не найден, пропускаем обработку (не можем опубликовать без chat_id)
+-                        log_send_event(f"IMAP: chat_id not found for uid={user_id} acc_id={acc_id} email={email}, skipping result")
+-                        continue
+-                except:
+-                    pass
+-                
+-                # Если не удалось получить chat_id, пропускаем обработку
+-                continue
+-
+-            # Обработка результата
+-            # ВАЖНО: поддерживаем оба формата результатов для совместимости
+-            result_type = result.get("type")
+-            result_status = result.get("status")
+-            
+-            # Формат 1: новый формат с status="ok" и массивом messages
+-            if result_status == "ok":
+-                count = result.get("count", 0)
+-                messages = result.get("messages", [])
+-                
+-                # ВАЖНО: логируем получение результата для отладки
+-                if count > 0:
+-                    log_send_event(f"IMAP result: uid={user_id} acc_id={acc_id} email={email} count={count} messages={len(messages) if messages else 0} chat_id={chat_id}")
+-                
+-                # Получаем аккаунт
+-                acc = None
+-                try:
+-                    accounts = await list_accounts_async(user_id)
+-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+-                except Exception as e:
+-                    log_send_event(f"IMAP result processing error uid={user_id} acc_id={acc_id}: {e}")
+-                
+-                # ВАЖНО: проверяем все условия перед публикацией
+-                if count > 0 and messages and acc and chat_id:
+-                    # ВАЖНО: Проверяем период "карантина" для аккаунтов, добавленных через быстрое добавление
+-                    # Если аккаунт был активирован недавно, не публикуем письма, чтобы избежать публикации старых писем
+-                    key = (user_id, acc_id)
+-                    activated_at = QUICK_ADD_ACTIVATED_AT.get(key)
+-                    if activated_at is not None:
+-                        time_since_activation = time.time() - activated_at
+-                        if time_since_activation < QUICK_ADD_QUARANTINE_PERIOD:
+-                            # Аккаунт в периоде карантина - не публикуем письма
+-                            log_send_event(f"IMAP: Пропуск публикации {len(messages)} писем (период карантина, осталось {QUICK_ADD_QUARANTINE_PERIOD - time_since_activation:.1f}s) uid={user_id} acc_id={acc_id} email={email}")
+-                            continue
+-                        else:
+-                            # Период карантина истек - удаляем запись и публикуем письма
+-                            QUICK_ADD_ACTIVATED_AT.pop(key, None)
+-                            log_send_event(f"IMAP: Период карантина истек, публикуем письма uid={user_id} acc_id={acc_id} email={email}")
+-                    
+-                    # Публикуем сообщения
+-                    try:
+-                        log_send_event(f"IMAP: Publishing {len(messages)} messages for uid={user_id} acc_id={acc_id} email={email} chat_id={chat_id}")
+-                        for mdat in messages:
+-                            await publish_incoming_to_chat_async(user_id, acc, chat_id, mdat)
+-                        log_send_event(f"IMAP: Successfully published {len(messages)} messages for uid={user_id} acc_id={acc_id}")
+-                    except Exception as e:
+-                        log_send_event(f"IMAP publish messages error uid={user_id} acc_id={acc_id}: {e}")
+-                elif count > 0:
+-                    # Логируем, почему не публикуем
+-                    reasons = []
+-                    if not messages:
+-                        reasons.append("messages is empty")
+-                    if not acc:
+-                        reasons.append("acc is None")
+-                    if not chat_id:
+-                        reasons.append("chat_id is None")
+-                    log_send_event(f"IMAP: Skipping publication for uid={user_id} acc_id={acc_id} count={count}: {', '.join(reasons)}")
+-            
+-            # Формат 2: старый формат с type="incoming_message" (для совместимости)
+-            elif result_type == "incoming_message":
+-                try:
+-                    message_data = result.get("message")
+-                    
+-                    if not user_id or not acc_id or not chat_id or not message_data:
+-                        log_send_event(f"IMAP: Incomplete incoming_message data uid={user_id} acc_id={acc_id} chat_id={chat_id}")
+-                        continue
+-                    
+-                    # Получаем объект аккаунта (для контекста)
+-                    accounts = await list_accounts_async(user_id)
+-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+-                    
+-                    if not acc:
+-                        log_send_event(f"IMAP: Account not found uid={user_id} acc_id={acc_id}")
+-                        continue
+-                    
+-                    # ВАЖНО: Проверяем период "карантина" для аккаунтов, добавленных через быстрое добавление
+-                    key = (user_id, acc_id)
+-                    activated_at = QUICK_ADD_ACTIVATED_AT.get(key)
+-                    if activated_at is not None:
+-                        time_since_activation = time.time() - activated_at
+-                        if time_since_activation < QUICK_ADD_QUARANTINE_PERIOD:
+-                            # Аккаунт в периоде карантина - не публикуем письма
+-                            log_send_event(f"IMAP: Пропуск публикации письма (период карантина, осталось {QUICK_ADD_QUARANTINE_PERIOD - time_since_activation:.1f}s) uid={user_id} acc_id={acc_id}")
+-                            continue
+-                        else:
+-                            # Период карантина истек - удаляем запись и публикуем письма
+-                            QUICK_ADD_ACTIVATED_AT.pop(key, None)
+-                            log_send_event(f"IMAP: Период карантина истек, публикуем письмо uid={user_id} acc_id={acc_id}")
+-                    
+-                    # ВАЖНО: публикуем входящее сообщение
+-                    log_send_event(f"IMAP: Publishing incoming_message (old format) uid={user_id} acc_id={acc_id} chat_id={chat_id}")
+-                    await publish_incoming_to_chat_async(user_id, acc, chat_id, message_data)
+-                    log_send_event(f"IMAP: Successfully published incoming_message uid={user_id} acc_id={acc_id}")
+-                except Exception as e:
+-                    log_send_event(f"IMAP publish error (old format) uid={user_id} acc_id={acc_id}: {e}")
+-            
+-            # Обновление статуса и сохранение прокси для SMTP (только для формата status="ok")
+-            if result_status == "ok":
+-                acc = None
+-                try:
+-                    accounts = await list_accounts_async(user_id)
+-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+-                except Exception as e:
+-                    pass
+-                
+-                if acc:
+-                    st = ensure_user_imap_status(user_id)
+-                    async with st.lock:
+-                        st.account_status.setdefault(acc.email, {})
+-                        # Получаем прокси из конфигурации процесса (если еще не сохранен)
+-                        proxy = st.account_status.get("_proxy_map", {}).get(acc.email)
+-                        if proxy:
+-                            st.account_status[acc.email]["proxy"] = proxy
+-                        
+-                        st.account_status[acc.email].update({
+-                            "active": True,
+-                            "last_ok": str(int(time.time())),
+-                            "last_err": None,
+-                            "retries": 0,
+-                        })
+-                    
+-                    # Сохраняем sticky proxy только для IMAP (чтение)
+-                    # ВАЖНО: sticky proxy больше НЕ используется для отправки писем (SMTP)
+-                    # Отправка использует простой round-robin по всем send-прокси из контекста
+-                    # TODO: Для долговременного хранения нужно сохранять sticky proxy в БД
+-                    # (например, в таблице accounts добавить поле sticky_proxy_json или отдельная таблица account_proxy_sticky)
+-                    if proxy:
+-                        try:
+-                            # Сохраняем sticky proxy для IMAP (чтение) - для отправки не используется
+-                            if hasattr(smtp25, 'set_sticky_proxy_for_account'):
+-                                smtp25.set_sticky_proxy_for_account(user_id, acc.email, proxy)
+-                            
+-                            # TODO: Сохранить sticky proxy в БД для долговременного хранения
+-                            # await save_account_sticky_proxy_async(user_id, acc.email, proxy)
+-                        except Exception as e:
+-                            # Игнорируем ошибки, если функция не доступна или не работает
+-                            pass
+-            
+-            elif result.get("status") == "auth_error":
+-                # Постоянная ошибка авторизации
+-                try:
+-                    accounts = await list_accounts_async(user_id)
+-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+-                    if acc:
+-                        st = ensure_user_imap_status(user_id)
+-                        async with st.lock:
+-                            st.account_status.setdefault(acc.email, {})
+-                            st.account_status[acc.email].update({
+-                        "active": False,
+-                        "perm_auth_error": True,
+-                        "reading_disabled_due_to_auth": True,
+-                                "last_err": "Permanent auth error",
+-                            })
+-                        
+-                        # ВАЖНО: Отключаем аккаунт для сендинга при ошибке авторизации
+-                        try:
+-                            await ensure_send_disabled_loaded(user_id)
+-                            disabled = SEND_DISABLED_ACCOUNTS.setdefault(user_id, set())
+-                            was_send_enabled = acc_id not in disabled
+-                            
+-                            # Добавляем аккаунт в список отключенных для сендинга
+-                            disabled.add(acc_id)
+-                            await set_setting_async(user_id, f"send_disabled_{acc_id}", "1")
+-                            
+-                            # Инвалидируем контекст пользователя, чтобы изменения применились сразу
+-                            try:
+-                                invalidate_user_ctx(user_id)
+-                            except Exception:
+-                                pass
+-                            
+-                            if was_send_enabled:
+-                                log_send_event(
+-                                    f"IMAP: Аккаунт {acc.email} (acc_id={acc_id}) отключен для сендинга "
+-                                    f"из-за ошибки авторизации (был включен для сендинга)"
+-                                )
+-                        except Exception as e_send:
+-                            log_send_event(
+-                                f"IMAP: Ошибка при отключении аккаунта для сендинга "
+-                                f"uid={user_id} acc_id={acc_id} email={acc.email}: {e_send}"
+-                            )
+-                        
+-                        # Логирование и уведомление пользователю
+-                        key_notify = (user_id, acc.email)
+-                        if not PERM_AUTH_NOTIFIED.get(key_notify):
+-                            PERM_AUTH_NOTIFIED[key_notify] = True
+-                            log_send_event(f"IMAP: Permanent auth error detected for uid={user_id} acc_id={acc_id} email={acc.email}, disabling account")
+-                            # ВАЖНО: проверяем chat_id перед отправкой уведомления
+-                            if chat_id:
+-                                try:
+-                                    await bot.send_message(
+-                                        chat_id,
+-                                        f"Аккаунт {code(acc.email)} отключён: неверные учетные данные.\n"
+-                                        f"Аккаунт отключен для чтения и сендинга.\n"
+-                                        f"Исправьте пароль и запустите /read."
+-                                    )
+-                                except Exception as e:
+-                                    log_send_event(f"IMAP: Failed to send notification to chat_id={chat_id} for uid={user_id} acc_id={acc_id}: {e}")
+-                            else:
+-                                log_send_event(f"IMAP: Cannot send auth error notification for uid={user_id} acc_id={acc_id}: chat_id not found")
+-                        
+-                        # Удаляем аккаунт из обработки
+-                        await stop_imap_process(user_id, acc_id)
+-                except Exception as e:
+-                    log_send_event(f"IMAP auth error handling uid={user_id} acc_id={acc_id}: {e}")
+-            
+-            elif result.get("status") == "temp_error":
+-                # Временная ошибка - обновляем статус, но продолжаем
+-                try:
+-                    accounts = await list_accounts_async(user_id)
+-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+-                    if acc:
+-                        st = ensure_user_imap_status(user_id)
+-                        async with st.lock:
+-                            st.account_status.setdefault(acc.email, {})
+-                            st_entry = st.account_status[acc.email]
+-                            retries = int(st_entry.get("retries", 0)) + 1
+-                            backoff_soft = min(IMAP_BACKOFF_MAX, 5 * (1.5 ** min(retries, 6)))
+-                            st_entry.update({
+-                                "active": False,
+-                                "last_err": result.get("error", "Temporary error"),
+-                                "retries": retries,
+-                                "retry_at": time.time() + backoff_soft,
+-                            })
+-                except Exception as e:
+-                    log_send_event(f"IMAP temp error handling uid={user_id} acc_id={acc_id}: {e}")
+-
+-        except asyncio.CancelledError:
+-            break
+-        except Exception as e:
+-            log_send_event(f"IMAP global result processor error: {e}")
+-            await asyncio.sleep(1.0)
+-
+-async def _imap_watchdog():
+-    """
+-    Watchdog для мониторинга воркеров пула и перезапуска упавших процессов.
+-    Проверяет воркеры каждые 30 секунд, очищает мертвые процессы и перезапускает упавшие.
+-    ВАЖНО: Периодически очищает мертвые процессы из списка, чтобы предотвратить утечку памяти.
+-    """
+-    while True:
+-        try:
+-            await asyncio.sleep(30.0)  # Проверка каждые 30 секунд
+-            
+-            # ВАЖНО: Сначала очищаем мертвые процессы из списка
+-            # Это предотвращает накопление мертвых процессов в памяти
+-            try:
+-                dead_count = _cleanup_dead_workers()
+-                if dead_count > 0:
+-                    log_send_event(f"IMAP: Cleaned up {dead_count} dead workers")
+-            except Exception as e:
+-                log_send_event(f"IMAP: Error cleaning up dead workers: {e}")
+-            
+-            # Проверяем воркеры пула
+-            # ВАЖНО: проверяем только если пул инициализирован
+-            if IMAP_WORKER_PROCESSES and IMAP_ACCOUNT_QUEUE is not None and IMAP_RESULT_QUEUE is not None and IMAP_WORKER_STOP_EVENT is not None:
+-                # Проверяем каждый воркер и перезапускаем упавшие
+-                for i, proc in enumerate(list(IMAP_WORKER_PROCESSES)):
+-                    try:
+-                        if not proc.is_alive():
+-                            # Воркер упал - перезапускаем
+-                            try:
+-                                log_send_event(f"IMAP: Worker {i} died, restarting...")
+-                                # ВАЖНО: Используем тот же контекст multiprocessing, что и при инициализации
+-                                if IMAP_MP_CONTEXT is None:
+-                                    import multiprocessing as _mp
+-                                    ctx = _mp.get_context("spawn")
+-                                else:
+-                                    ctx = IMAP_MP_CONTEXT
+-                                
+-                                new_proc = ctx.Process(
+-                                    target=_imap_worker_pool_worker,
+-                                    args=(
+-                                        IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_STOP_EVENT,
+-                                        IMAP_POLL_INTERVAL_MIN, IMAP_POLL_INTERVAL_MAX,
+-                                        IMAP_CONNECTION_TIMEOUT, IMAP_READ_TIMEOUT, IMAP_WRITE_TIMEOUT,
+-                                        IMAP_NOOP_TIMEOUT, IMAP_RECONNECT_DELAY, IMAP_MAX_RECONNECT_ATTEMPTS, IMAP_PORT_SSL
+-                                    ),
+-                                    name=f"imap-worker-{i}",
+-                                    daemon=True
+-                                )
+-                                new_proc.start()
+-                                # Заменяем мертвый процесс на новый в списке
+-                                if i < len(IMAP_WORKER_PROCESSES):
+-                                    IMAP_WORKER_PROCESSES[i] = new_proc
+-                                else:
+-                                    IMAP_WORKER_PROCESSES.append(new_proc)
+-                                log_send_event(f"IMAP: Worker {i} restarted")
+-                            except Exception as e:
+-                                log_send_event(f"IMAP: Failed to restart worker {i}: {e}")
+-                    except Exception as e:
+-                        log_send_event(f"IMAP: Error checking worker {i}: {e}")
+-                
+-                # ВАЖНО: Если количество живых воркеров меньше требуемого, добавляем новые
+-                try:
+-                    alive_count = sum(1 for p in IMAP_WORKER_PROCESSES if p.is_alive())
+-                    if alive_count < IMAP_PROCESS_POOL_SIZE:
+-                        needed = IMAP_PROCESS_POOL_SIZE - alive_count
+-                        log_send_event(f"IMAP: Only {alive_count}/{IMAP_PROCESS_POOL_SIZE} workers alive, creating {needed} new workers")
+-                        for _ in range(needed):
+-                            try:
+-                                # ВАЖНО: Используем тот же контекст multiprocessing, что и при инициализации
+-                                if IMAP_MP_CONTEXT is None:
+-                                    import multiprocessing as _mp
+-                                    ctx = _mp.get_context("spawn")
+-                                else:
+-                                    ctx = IMAP_MP_CONTEXT
+-                                
+-                                worker_index = len(IMAP_WORKER_PROCESSES)
+-                                new_proc = ctx.Process(
+-                                    target=_imap_worker_pool_worker,
+-                                    args=(
+-                                        IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_STOP_EVENT,
+-                                        IMAP_POLL_INTERVAL_MIN, IMAP_POLL_INTERVAL_MAX,
+-                                        IMAP_CONNECTION_TIMEOUT, IMAP_READ_TIMEOUT, IMAP_WRITE_TIMEOUT,
+-                                        IMAP_NOOP_TIMEOUT, IMAP_RECONNECT_DELAY, IMAP_MAX_RECONNECT_ATTEMPTS, IMAP_PORT_SSL
+-                                    ),
+-                                    name=f"imap-worker-{worker_index}",
+-                                    daemon=True
+-                                )
+-                                new_proc.start()
+-                                IMAP_WORKER_PROCESSES.append(new_proc)
+-                            except Exception as e:
+-                                log_send_event(f"IMAP: Failed to create new worker: {e}")
+-                except Exception as e:
+-                    log_send_event(f"IMAP: Error checking worker count: {e}")
+-        except asyncio.CancelledError:
+-            break
+-        except Exception as e:
+-            log_send_event(f"IMAP watchdog error: {e}")
+-            await asyncio.sleep(10.0)
+ 
+ def get_account_proxy(user_id: int, email: str) -> Optional[Dict[str, Any]]:
+     """
+@@ -10272,62 +9572,6 @@ async def get_account_proxy_async(user_id: int, email: str) -> Optional[Dict[str
+     except Exception:
+         return None
+ 
+-async def _schedule_all_active_accounts(uid: int, chat_id: int):
+-    """
+-    Сканирует активные аккаунты пользователя и запускает процессы IMAP для каждого.
+-    """
+-    st = ensure_user_imap_status(uid)
+-    async with st.lock:
+-        st.running = True
+-        st.account_status.setdefault("_meta", {})["chat_id"] = chat_id
+-
+-    accounts = await list_accounts_async(uid)
+-    active = [a for a in accounts if getattr(a, "active", False) and getattr(a, "email", "")]
+-    async with st.lock:
+-        st.accounts = {a.email: a for a in active}
+-        st.last_accounts_check = time.time()
+-
+-    # Получаем контекст для прокси
+-    ctx = await get_user_ctx_async(uid)
+-    
+-    # Запускаем процесс для каждого активного аккаунта
+-    for a in active:
+-        try:
+-            # Получаем прокси для аккаунта (ОБЯЗАТЕЛЬНО)
+-            proxy = None
+-            try:
+-                proxy = smtp25.get_next_proxy_ctx(ctx, "send")
+-            except Exception as e:
+-                log_send_event(f"IMAP: Failed to get proxy for uid={uid} acc_id={getattr(a, 'id')} email={getattr(a, 'email', '')}: {e}")
+-            
+-            # Проверка наличия прокси перед запуском
+-            if not proxy:
+-                log_send_event(f"IMAP: Skipping account uid={uid} acc_id={getattr(a, 'id')} email={getattr(a, 'email', '')}: no proxy available (proxy is required)")
+-                # Обновляем статус аккаунта - отключаем чтение из-за отсутствия прокси
+-                st = ensure_user_imap_status(uid)
+-                async with st.lock:
+-                    st.account_status.setdefault(getattr(a, "email", ""), {})
+-                    st.account_status[getattr(a, "email", "")].update({
+-                        "active": False,
+-                        "last_err": "No proxy available (proxy is required for IMAP)",
+-                    })
+-                continue
+-            
+-            # Запускаем процесс (прокси уже проверен в start_imap_process, но проверяем здесь для логирования)
+-            # ВАЖНО: start_imap_process сам обновляет st.accounts и st.account_status, поэтому здесь не нужно дублировать
+-            success = await start_imap_process(
+-                user_id=uid,
+-                acc_id=int(getattr(a, "id")),
+-                email=getattr(a, "email", ""),
+-                password=getattr(a, "password", ""),
+-                display_name=getattr(a, "display_name", "") or getattr(a, "name", "") or "",
+-                chat_id=chat_id,
+-                proxy=proxy
+-            )
+-            if not success:
+-                log_send_event(f"IMAP: Failed to start process uid={uid} acc_id={getattr(a, 'id')} email={getattr(a, 'email', '')} (check logs above for reason)")
+-        except Exception as e:
+-            log_send_event(f"IMAP: Exception starting process uid={uid} acc_id={getattr(a, 'id')}: {e}")
+ 
+ def resolve_imap_host(email_addr: str) -> str:
+     domain = (email_addr.split("@", 1)[1] if "@" in email_addr else "").lower()
+@@ -10964,16 +10208,23 @@ async def publish_incoming_to_chat_async(
+     )
+ 
+     # runtime-трек
++    # ВАЖНО: Записываем с user_id (как в старой версии) и также с internal_uid для совместимости
+     try:
+-        INCOMING_RT[(user_id, int(tg_msg.message_id))] = {
++        internal_uid = await incoming_rt_key_from_tg(chat_id)
++        rt_data = {
+             "acc_id": int(getattr(acc, "id")),
+             "from_email": from_email,
+             "from_name": from_name,
+             "subject": subject,
+             "created_ts": time.time(),  # ВАЖНО: сохраняем timestamp создания для правильной очистки
+         }
+-    except Exception:
+-        pass
++        # Записываем с user_id (как в старой версии)
++        INCOMING_RT[(user_id, int(tg_msg.message_id))] = rt_data
++        # Также записываем с internal_uid для совместимости с новым кодом
++        if internal_uid != user_id:
++            INCOMING_RT[(internal_uid, int(tg_msg.message_id))] = rt_data
++    except Exception as e_rt:
++        log_send_event(f"INCOMING_RT save error uid={user_id} internal_uid={internal_uid} chat_id={chat_id} mid={tg_msg.message_id}: {e_rt}")
+ 
+     # Второй проход клавиатуры (оставляем)
+     try:
+@@ -11023,18 +10274,125 @@ async def publish_incoming_to_chat_async(
+     except Exception as e:
+         log_send_event(f"AI autostart error in publish_incoming uid={user_id} from={from_email}: {e}")
+         
+-# ====== УДАЛЕНО: Старая логика IMAP (async воркеры) ======
+-# Используется только новая архитектура с process pool
+-# Все старые функции удалены:
+-# - async def _refresh_active_accounts_for_user - УДАЛЕНО
+-# - async def _pick_next_email - УДАЛЕНО
+-# - async def _user_imap_worker - УДАЛЕНО
+ 
++async def imap_results_drain_loop():
++    """
++    Дренер очереди imap_runtime.RESULT_QUEUE:
++    забирает сырые письма из воркеров IMAP, формирует mdat и вызывает publish_incoming_to_chat_async.
++    Ожидается, что imap_runtime кладет в очередь кортеж:
++        (user_id, acc_id, chat_id, email, msgs)
++    где msgs: список (uid, raw_bytes)
++    """
++    import email as _email
++    from email.utils import parseaddr
+ 
+-# Старая функция _sync_imap_fetch удалена - используется process pool архитектура
++    loop = asyncio.get_running_loop()
++    q = imap_runtime.RESULT_QUEUE
++    
++    processed_messages = IMAP_PROCESSED_MESSAGES
++    
++    MIN_PUBLISH_INTERVAL = 2.0
++    last_publish_time = 0.0
++
++    while True:
++        item = await loop.run_in_executor(None, q.get)
++
++        if item is None:
++            await asyncio.sleep(0.1)
++            continue
++
++        user_id, acc_id, chat_id, email_addr, msgs = item
++
++        key = (int(user_id), int(acc_id))
++        IMAP_ACCOUNT_STATUS[key] = {"active": True, "email": email_addr}
++
++        try:
++            accounts = await list_accounts_async(user_id)
++            acc = next((a for a in accounts if int(getattr(a, "id")) == int(acc_id)), None)
++        except Exception:
++            acc = None
++
++        if acc is None:
++            log_send_event(f"IMAP: account not found for uid={user_id} acc_id={acc_id}, skip incoming")
++            continue
++
++        for uid, raw_bytes in msgs:
++            msg_key = (int(user_id), int(acc_id), int(uid))
++            if msg_key in processed_messages:
++                log_send_event(f"IMAP: skipping duplicate message uid={uid} user_id={user_id} acc_id={acc_id}")
++                continue
++            
++            processed_messages[msg_key] = True
++            try:
++                msg_obj = _email.message_from_bytes(raw_bytes)
++
++                # Subject
++                subject = msg_obj.get("Subject", "") or ""
++
++                # From: парсим в (name, email_addr)
++                from_header = msg_obj.get("From", "") or ""
++                from_name = ""
++                from_email = ""
++                if from_header:
++                    try:
++                        name, addr = parseaddr(from_header)
++                        from_name = name or ""
++                        from_email = addr or ""
++                    except Exception:
++                        # fallback: старое поведение, но лучше всё равно чистить
++                        from_email = from_header
++                        from_name = ""
++
++                # Тело письма
++                body = ""
++                if msg_obj.is_multipart():
++                    for part in msg_obj.walk():
++                        ctype = part.get_content_type()
++                        disp = part.get("Content-Disposition", "")
++                        if ctype == "text/plain" and "attachment" not in (disp or "").lower():
++                            try:
++                                body = part.get_payload(decode=True).decode(
++                                    part.get_content_charset() or "utf-8",
++                                    errors="replace",
++                                )
++                                break
++                            except Exception:
++                                continue
++                else:
++                    try:
++                        body = msg_obj.get_payload(decode=True).decode(
++                            msg_obj.get_content_charset() or "utf-8",
++                            errors="replace",
++                        )
++                    except Exception:
++                        body = msg_obj.get_payload()
++
++                mdat = {
++                    "from_email": from_email,
++                    "from_name": from_name,
++                    "subject": subject,
++                    "body": body,
++                    "uid": str(uid),
++                }
++
++                current_time = time.time()
++                time_since_last_publish = current_time - last_publish_time
++                if time_since_last_publish < MIN_PUBLISH_INTERVAL:
++                    await asyncio.sleep(MIN_PUBLISH_INTERVAL - time_since_last_publish)
++                
++                await publish_incoming_to_chat_async(
++                    user_id=user_id,
++                    acc=acc,
++                    chat_id=chat_id,
++                    mdat=mdat,
++                )
++                
++                last_publish_time = time.time()
++            except Exception as e:
++                log_send_event(f"IMAP drain error uid={user_id} acc_id={acc_id}: {e}")
++                traceback.print_exc()
++                continue
+ 
+-# Старая функция fetch_and_post_new_mails удалена - используется process pool архитектура
+-# Логика публикации сообщений перенесена в _process_imap_results
+         
+ @dp.callback_query(F.data.startswith("adlink:create:"))
+ async def adlink_create_cb(c: types.CallbackQuery):
+@@ -11053,16 +10411,31 @@ async def adlink_create_cb(c: types.CallbackQuery):
+       - Переключение команды не стирает значения токенов и профилей.
+       - При генерации ссылки используются токены и профиль выбранной команды.
+     """
++    import json, re, unicodedata, asyncio, urllib.parse
++    import sys
++    
++    try:
++        log_send_event(f"[ADLINK_CREATE] Function called")
++    except:
++        pass
++    
+     if not await ensure_approved(c):
++        try:
++            log_send_event(f"[ADLINK_CREATE] User not approved")
++        except:
++            pass
+         return
+ 
+     await safe_cq_answer(c)  # ранний ACK
+ 
+-    import json, re, unicodedata, asyncio, urllib.parse
+-
+     chat_id = c.message.chat.id
+     uid = await U(c)
+     admin = is_admin(c.from_user.id)
++    
++    try:
++        log_send_event(f"[ADLINK_CREATE] Started: chat_id={chat_id}, uid={uid}, admin={admin}")
++    except:
++        pass
+     team_mode_raw = await get_setting_async(uid, "team_mode", "nur")
+     team_mode = (team_mode_raw or "nur").strip().lower()
+     # Нормализуем значение team_mode (заменяем пробелы на подчеркивания, приводим к нижнему регистру)
+@@ -11086,7 +10459,6 @@ async def adlink_create_cb(c: types.CallbackQuery):
+         await set_setting_async(uid, "team_mode", "nur")
+     
+     # Отладочное логирование (можно убрать после проверки)
+-    import sys
+     try:
+         print(f"[DEBUG adlink_create] uid={uid}, team_mode_raw='{team_mode_raw}', team_mode='{team_mode}', admin={admin}", file=sys.stderr, flush=True)
+     except:
+@@ -11099,13 +10471,29 @@ async def adlink_create_cb(c: types.CallbackQuery):
+         origin_mid = c.message.message_id
+ 
+     # Контекст входящего
+-    rt = INCOMING_RT.get((uid, origin_mid)) or INCOMING_RT.get((uid, c.message.message_id))
++    # ВАЖНО: Используем internal_uid для совместимости со старой версией
++    internal_uid = await incoming_rt_key_from_tg(chat_id)
++    rt = INCOMING_RT.get((internal_uid, origin_mid)) or INCOMING_RT.get((chat_id, origin_mid)) or INCOMING_RT.get((uid, origin_mid))
+     if not rt:
++        rt = INCOMING_RT.get((internal_uid, c.message.message_id)) or INCOMING_RT.get((chat_id, c.message.message_id)) or INCOMING_RT.get((uid, c.message.message_id))
++    try:
++        log_send_event(f"[ADLINK_CREATE] Checking INCOMING_RT: chat_id={chat_id}, uid={uid}, internal_uid={internal_uid}, origin_mid={origin_mid}, msg_id={c.message.message_id}, found={bool(rt)}")
++    except:
++        pass
++    if not rt:
++        try:
++            log_send_event(f"[ADLINK_CREATE] ERROR: No INCOMING_RT data for chat_id={chat_id}, uid={uid}, internal_uid={internal_uid}, origin_mid={origin_mid}, msg_id={c.message.message_id}")
++        except:
++            pass
+         await safe_cq_answer(c, "Нет данных письма", show_alert=True)
+         return
+ 
+     from_email = (rt.get("from_email") or "").strip()
+     if "@" not in from_email:
++        try:
++            log_send_event(f"[ADLINK_CREATE] ERROR: Invalid email: {from_email}")
++        except:
++            pass
+         await safe_cq_answer(c, "Email некорректен", show_alert=True)
+         return
+     local_part = from_email.split("@", 1)[0]
+@@ -11118,20 +10506,44 @@ async def adlink_create_cb(c: types.CallbackQuery):
+         return s
+ 
+     k_local = _n(local_part)
++    try:
++        log_send_event(f"[ADLINK_CREATE] from_email={from_email}, local_part={local_part}, k_local={k_local}")
++    except:
++        pass
++    
+     ad_id = AD_LOCAL2ID_PER_CHAT.get(chat_id, {}).get(k_local)
++    try:
++        log_send_event(f"[ADLINK_CREATE] Checking AD_LOCAL2ID_PER_CHAT: chat_id={chat_id}, k_local={k_local}, ad_id={ad_id}, cache_keys_count={len(AD_LOCAL2ID_PER_CHAT.get(chat_id, {}))}")
++        if not ad_id:
++            cache_keys = list(AD_LOCAL2ID_PER_CHAT.get(chat_id, {}).keys())[:10]
++            log_send_event(f"[ADLINK_CREATE] Available cache keys (first 10): {cache_keys}")
++    except:
++        pass
+     if not ad_id:
+         await safe_cq_answer(c, "ID не найден", show_alert=True)
+         return
+ 
+     ad_entry = AD_ADS_BY_ID_PER_CHAT.get(chat_id, {}).get(ad_id)
++    try:
++        log_send_event(f"[ADLINK_CREATE] Checking AD_ADS_BY_ID_PER_CHAT: chat_id={chat_id}, ad_id={ad_id}, found={bool(ad_entry)}")
++    except:
++        pass
+     if not ad_entry:
+         await safe_cq_answer(c, "Объявление не найдено", show_alert=True)
+         return
+ 
+     original = ad_entry["link"]
++    try:
++        log_send_event(f"[ADLINK_CREATE] Found original link: {original[:100] if original else 'None'}")
++    except:
++        pass
+ 
+     gen_for_chat = AD_GENERATED_LINKS_PER_CHAT.setdefault(chat_id, {})
+     if k_local in gen_for_chat:
++        try:
++            log_send_event(f"[ADLINK_CREATE] Link already exists in cache for k_local={k_local}")
++        except:
++            pass
+         entry = gen_for_chat[k_local]
+         mid = int(entry.get("result_msg_id") or 0)
+         if mid:
+@@ -11143,7 +10555,15 @@ async def adlink_create_cb(c: types.CallbackQuery):
+         return
+ 
+     # Функция метаданных (название/цена/фото)
++    try:
++        log_send_event(f"[ADLINK_CREATE] Fetching metadata for: {original[:100]}")
++    except:
++        pass
+     title, price, photo_url = await fetch_ad_metadata(original)
++    try:
++        log_send_event(f"[ADLINK_CREATE] Metadata fetched: title={bool(title)}, price={bool(price)}, photo_url={bool(photo_url)}")
++    except:
++        pass
+ 
+     # ==== ВЕТКА DOLCE (доступна только админу при выбранной команде 'dolce') ====
+     # Использует свои токены (dolce_team_base, dolce_worker_token)
+@@ -11348,13 +10768,29 @@ async def adlink_create_cb(c: types.CallbackQuery):
+ 
+         # Кэш Aqua team (используем тот же кэш, но с префиксом)
+         cache_key = (original, profile_id, tuple(services), "aqua_team")
++        try:
++            log_send_event(f"[ADLINK_CREATE] AQUA: Checking cache, profile_id={profile_id}, services={services}")
++        except:
++            pass
+         try:
+             cached = GOO_LINK_CACHE.get(cache_key)  # type: ignore[name-defined]
+-        except Exception:
++        except Exception as e_cache:
++            try:
++                log_send_event(f"[ADLINK_CREATE] AQUA: Cache get error: {type(e_cache).__name__}: {e_cache}")
++            except:
++                pass
+             cached = None
+         if cached:
++            try:
++                log_send_event(f"[ADLINK_CREATE] AQUA: Cache HIT, using cached link")
++            except:
++                pass
+             short_link, last_service = cached
+         else:
++            try:
++                log_send_event(f"[ADLINK_CREATE] AQUA: Cache MISS, making API request")
++            except:
++                pass
+             endpoint = "https://api-aq.goo.network/api/generate/single/parse"
+             headers = {
+                 "Authorization": f"Apikey {user_key}",
+@@ -11417,6 +10853,10 @@ async def adlink_create_cb(c: types.CallbackQuery):
+                         p.cancel()
+ 
+             if not short_link:
++                try:
++                    log_send_event(f"[ADLINK_CREATE] AQUA: ERROR - No link returned. service={last_service}, status={last_status}, raw={last_raw[:200]}")
++                except:
++                    pass
+                 await safe_cq_answer(c, "Aqua team: ошибка API", show_alert=True)
+                 diag = (f"Aqua team не вернул ссылку.\nservice={last_service}\nstatus={last_status}\nresp={last_raw}")
+                 try:
+@@ -11427,9 +10867,21 @@ async def adlink_create_cb(c: types.CallbackQuery):
+ 
+             try:
+                 GOO_LINK_CACHE[cache_key] = (short_link, last_service)  # type: ignore[name-defined]
+-            except Exception:
+-                pass
++                try:
++                    log_send_event(f"[ADLINK_CREATE] AQUA: Saved to cache: {short_link[:100]}")
++                except:
++                    pass
++            except Exception as e_save:
++                try:
++                    log_send_event(f"[ADLINK_CREATE] AQUA: Cache save error: {type(e_save).__name__}: {e_save}")
++                except:
++                    pass
+ 
++        try:
++            log_send_event(f"[ADLINK_CREATE] AQUA: Creating gen_for_chat entry: k_local={k_local}, ad_id={ad_id}, short_link={short_link[:100] if short_link else 'None'}")
++        except:
++            pass
++        
+         gen_for_chat[k_local] = {
+             "ad_id": ad_id,
+             "short": short_link,
+@@ -11494,10 +10946,21 @@ async def adlink_create_cb(c: types.CallbackQuery):
+             base_mid = origin_mid or c.message.message_id
+             kb_new = await build_incoming_reply_kb_async(chat_id, base_mid)
+             await safe_edit_reply_markup(chat_id, base_mid, kb_new)
+-        except Exception:
+-            pass
++        except Exception as e_kb:
++            try:
++                log_send_event(f"[ADLINK_CREATE] AQUA: KB update error: {type(e_kb).__name__}: {e_kb}")
++            except:
++                pass
+ 
++        try:
++            log_send_event(f"[ADLINK_CREATE] AQUA: Saving cache")
++        except:
++            pass
+         await save_ad_cache_async(chat_id)
++        try:
++            log_send_event(f"[ADLINK_CREATE] AQUA: SUCCESS - Link generated and saved")
++        except:
++            pass
+         await safe_cq_answer(c, "Создано")
+         return
+ 
+@@ -11534,13 +10997,29 @@ async def adlink_create_cb(c: types.CallbackQuery):
+ 
+     # Кэш Goo
+     cache_key = (original, profile_id, tuple(services))
++    try:
++        log_send_event(f"[ADLINK_CREATE] GOO/NUR: Checking cache, profile_id={profile_id}, services={services}")
++    except:
++        pass
+     try:
+         cached = GOO_LINK_CACHE.get(cache_key)  # type: ignore[name-defined]
+-    except Exception:
++    except Exception as e_cache:
++        try:
++            log_send_event(f"[ADLINK_CREATE] GOO/NUR: Cache get error: {type(e_cache).__name__}: {e_cache}")
++        except:
++            pass
+         cached = None
+     if cached:
++        try:
++            log_send_event(f"[ADLINK_CREATE] GOO/NUR: Cache HIT, using cached link")
++        except:
++            pass
+         short_link, last_service = cached
+     else:
++        try:
++            log_send_event(f"[ADLINK_CREATE] GOO/NUR: Cache MISS, making API request")
++        except:
++            pass
+         endpoint = "https://api.goo.network/api/generate/single/parse"
+         headers = {
+             "Authorization": f"Apikey {user_key}",
+@@ -11579,30 +11058,61 @@ async def adlink_create_cb(c: types.CallbackQuery):
+         last_status = None
+         last_raw = ""
+         last_service = ""
++        try:
++            log_send_event(f"[ADLINK_CREATE] GOO/NUR: Starting {len(tasks)} API tasks")
++        except:
++            pass
+         try:
+             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED, timeout=25)
+             for d in done:
+                 sv, link, st, raw = await d
+                 last_status = st; last_raw = raw; last_service = sv
++                try:
++                    log_send_event(f"[ADLINK_CREATE] GOO/NUR: Service {sv} returned: status={st}, has_link={bool(link)}")
++                except:
++                    pass
+                 if link:
+                     short_link = link
++                    try:
++                        log_send_event(f"[ADLINK_CREATE] GOO/NUR: Got link from {sv}: {link[:100]}")
++                    except:
++                        pass
+                     break
+             if not short_link:
++                try:
++                    log_send_event(f"[ADLINK_CREATE] GOO/NUR: No link from first batch, checking {len(pending)} pending tasks")
++                except:
++                    pass
+                 for d in pending:
+                     try:
+                         sv, link, st, raw = await asyncio.wait_for(d, timeout=10)
+                         last_status = st; last_raw = raw; last_service = sv
++                        try:
++                            log_send_event(f"[ADLINK_CREATE] GOO/NUR: Pending service {sv} returned: status={st}, has_link={bool(link)}")
++                        except:
++                            pass
+                         if link:
+                             short_link = link
++                            try:
++                                log_send_event(f"[ADLINK_CREATE] GOO/NUR: Got link from pending {sv}: {link[:100]}")
++                            except:
++                                pass
+                             break
+-                    except Exception:
+-                        pass
++                    except Exception as e_pending:
++                        try:
++                            log_send_event(f"[ADLINK_CREATE] GOO/NUR: Pending task error: {type(e_pending).__name__}: {e_pending}")
++                        except:
++                            pass
+         finally:
+             for p in tasks:
+                 if not p.done():
+                     p.cancel()
+ 
+         if not short_link:
++            try:
++                log_send_event(f"[ADLINK_CREATE] GOO/NUR: ERROR - No link returned. service={last_service}, status={last_status}, raw={last_raw[:200]}")
++            except:
++                pass
+             await safe_cq_answer(c, "Ошибка API", show_alert=True)
+             diag = (f"Goo не вернул ссылку.\nservice={last_service}\nstatus={last_status}\nresp={last_raw}")
+             try:
+@@ -11613,9 +11123,21 @@ async def adlink_create_cb(c: types.CallbackQuery):
+ 
+         try:
+             GOO_LINK_CACHE[cache_key] = (short_link, last_service)  # type: ignore[name-defined]
+-        except Exception:
+-            pass
++            try:
++                log_send_event(f"[ADLINK_CREATE] GOO/NUR: Saved to cache: {short_link[:100]}")
++            except:
++                pass
++        except Exception as e_save:
++            try:
++                log_send_event(f"[ADLINK_CREATE] GOO/NUR: Cache save error: {type(e_save).__name__}: {e_save}")
++            except:
++                pass
+ 
++    try:
++        log_send_event(f"[ADLINK_CREATE] GOO/NUR: Creating gen_for_chat entry: k_local={k_local}, ad_id={ad_id}, short_link={short_link[:100] if short_link else 'None'}, last_service={last_service}")
++    except:
++        pass
++    
+     gen_for_chat[k_local] = {
+         "ad_id": ad_id,
+         "short": short_link,
+@@ -11629,6 +11151,11 @@ async def adlink_create_cb(c: types.CallbackQuery):
+         "ts": time.time(),
+     }
+     AD_CHAT_TS[chat_id] = time.time()
++    
++    try:
++        log_send_event(f"[ADLINK_CREATE] GOO/NUR: gen_for_chat entry created successfully")
++    except:
++        pass
+ 
+     def _cv(v: str) -> str:
+         return f"<code>{tg(v)}</code>" if v else ""
+@@ -11668,6 +11195,10 @@ async def adlink_create_cb(c: types.CallbackQuery):
+             pass
+ 
+     if not sent_photo:
++        try:
++            log_send_event(f"[ADLINK_CREATE] GOO/NUR: Sending text message with link")
++        except:
++            pass
+         tmsg = await bot.send_message(
+             chat_id,
+             caption,
+@@ -11675,17 +11206,32 @@ async def adlink_create_cb(c: types.CallbackQuery):
+             reply_markup=polya_kb
+         )
+         gen_for_chat[k_local]["result_msg_id"] = tmsg.message_id
++        try:
++            log_send_event(f"[ADLINK_CREATE] GOO/NUR: Message sent, msg_id={tmsg.message_id}")
++        except:
++            pass
+ 
+     try:
+         base_mid = origin_mid or c.message.message_id
+         kb_new = await build_incoming_reply_kb_async(chat_id, base_mid)
+         await safe_edit_reply_markup(chat_id, base_mid, kb_new)
+-    except Exception:
+-        pass
++    except Exception as e_kb:
++        try:
++            log_send_event(f"[ADLINK_CREATE] GOO/NUR: KB update error: {type(e_kb).__name__}: {e_kb}")
++        except:
++            pass
+ 
++    try:
++        log_send_event(f"[ADLINK_CREATE] GOO/NUR: Saving cache")
++    except:
++        pass
+     await save_ad_cache_async(chat_id)
++    try:
++        log_send_event(f"[ADLINK_CREATE] GOO/NUR: SUCCESS - Link generated and saved")
++    except:
++        pass
+     await safe_cq_answer(c, "Создано")
+-    
++
+ POLYA_API_KEY = "03ae8669-1c91-49b9-b395-92007f22043c"
+ 
+ @dp.callback_query(F.data.startswith("polya:ask:"))
+@@ -11820,15 +11366,16 @@ async def adlink_open_cb(c: types.CallbackQuery):
+     if not await ensure_approved(c):
+         return
+     chat_id = c.message.chat.id
+-    internal_uid = await U(c)
++    internal_uid = await incoming_rt_key_from_tg(chat_id)
+     try:
+         origin_mid = int(c.data.split(":")[2])
+     except Exception:
+         origin_mid = c.message.message_id
+ 
+-    rt = INCOMING_RT.get((internal_uid, origin_mid))
++    # Пробуем сначала с internal_uid, потом с chat_id (для обратной совместимости)
++    rt = INCOMING_RT.get((internal_uid, origin_mid)) or INCOMING_RT.get((chat_id, origin_mid))
+     if not rt:
+-        rt = INCOMING_RT.get((internal_uid, c.message.message_id))
++        rt = INCOMING_RT.get((internal_uid, c.message.message_id)) or INCOMING_RT.get((chat_id, c.message.message_id))
+     if not rt:
+         await c.answer("Нет контекста", show_alert=True)
+         return
+@@ -12209,7 +11756,11 @@ async def maybe_schedule_ai_assistant(
+                     if pid:
+                         await _ai_send_preset_reply(uid, chat_id, acc_obj, base_tg_message_id, from_email, subject, pid, slot_tag="1")
+                 elif step == "link":
+-                    link_ok = await _ai_generate_link(uid, chat_id, base_tg_message_id)
++                    try:
++                        link_ok = await _ai_generate_link(uid, chat_id, base_tg_message_id)
++                    except Exception as e:
++                        log_send_event(f"[AI_LINK_ERROR] uid={uid} chat_id={chat_id} mid={base_tg_message_id}: {e}")
++                        link_ok = False
+                 elif step == "html":
+                     if link_ok:
+                         await _ai_send_html_go(uid, chat_id, acc_obj, base_tg_message_id, to_email=from_email, subj_orig=subject)  # NEW
+@@ -12268,7 +11819,9 @@ async def _ai_generate_link(uid: int, chat_id: int, origin_mid: int) -> bool:
+       - если ссылка уже есть — шлёт «⬆️ Уже есть» на прежний лог
+     """
+     # Контекст входящего
+-    rt = INCOMING_RT.get((uid, origin_mid))
++    # ВАЖНО: Пробуем разные варианты ключей для совместимости
++    internal_uid = await incoming_rt_key_from_tg(chat_id)
++    rt = INCOMING_RT.get((internal_uid, origin_mid)) or INCOMING_RT.get((chat_id, origin_mid)) or INCOMING_RT.get((uid, origin_mid))
+     if not rt:
+         return False
+     from_email = (rt.get("from_email") or "").strip()
+@@ -12667,7 +12220,9 @@ async def _ai_send_polya(uid: int, chat_id: int, origin_mid: int, to_email: str)
+       - ошибка: 'Ошибка отправки Polya ❌ <текст>'
+     """
+     # Получаем ссылку из кэша по локалу отправителя
+-    rt = INCOMING_RT.get((uid, origin_mid)) or {}
++    # ВАЖНО: Пробуем разные варианты ключей для совместимости
++    internal_uid = await incoming_rt_key_from_tg(chat_id)
++    rt = INCOMING_RT.get((internal_uid, origin_mid)) or INCOMING_RT.get((chat_id, origin_mid)) or INCOMING_RT.get((uid, origin_mid)) or {}
+     from_email = (rt.get("from_email") or "").strip()
+     if "@" not in from_email:
+         return
+@@ -13118,60 +12673,25 @@ async def ai_xlsx_autoverify_cancel_all_for_user(uid: int) -> int:
+         
+ async def _ensure_imap_stopped_for_user(uid: int):
+     """
+-    Останавливает все процессы IMAP для пользователя.
+-    ВАЖНО: Принудительно останавливаем все аккаунты и очищаем статусы,
+-    чтобы гарантировать освобождение памяти и предотвратить накопление процессов.
++    Останавливает все IMAP-воркеры для пользователя через imap_runtime.
+     """
+     try:
+-        st = ensure_user_imap_status(uid)
+-        async with st.lock:
+-            st.running = False
+-        
+-        # Останавливаем все процессы пользователя
+-        # Останавливаем все аккаунты пользователя (новая архитектура)
+-        keys_to_stop = [key for key in list(IMAP_ACCOUNT_STATUS.keys()) if key[0] == uid]
+-        if keys_to_stop:
+-            log_send_event(f"IMAP: Stopping {len(keys_to_stop)} accounts for uid={uid}")
+-            for key in keys_to_stop:
+-                try:
+-                    await stop_imap_process(key[0], key[1])
+-                    # Принудительно помечаем как неактивный
+-                    IMAP_ACCOUNT_STATUS[key] = {"active": False}
+-                except Exception as e:
+-                    log_send_event(f"IMAP: Error stopping account uid={uid} acc_id={key[1]}: {e}")
+-                    # Даже при ошибке помечаем как неактивный
+-                    try:
+-                        IMAP_ACCOUNT_STATUS[key] = {"active": False}
+-                    except Exception:
+-                        pass
+-            
+-            # Дополнительная очистка: удаляем все записи статусов для пользователя
+-            # Это гарантирует, что воркеры не будут обрабатывать эти аккаунты
+-            for key in keys_to_stop:
+-                try:
+-                    IMAP_ACCOUNT_STATUS.pop(key, None)
+-                except Exception:
+-                    pass
+-            
+-            log_send_event(f"IMAP: All accounts stopped and cleaned up for uid={uid}")
+-        else:
+-            log_send_event(f"IMAP: No accounts to stop for uid={uid}")
+-        
+-        # Дополнительная очистка: очищаем статусы аккаунтов в runtime статусе
+-        try:
+-            async with st.lock:
+-                for email in list(st.account_status.keys()):
+-                    if email != "_meta":
+-                        acc_status = st.account_status.get(email, {})
+-                        if isinstance(acc_status, dict):
+-                            acc_status["active"] = False
+-        except Exception as e:
+-            log_send_event(f"IMAP: Error cleaning up account_status for uid={uid}: {e}")
++        accounts = await _get_user_accounts(uid)
++        for acc in accounts:
++            try:
++                acc_id = int(getattr(acc, "id"))
++                imap_runtime.stop_imap_for_account(uid, acc_id)
++                # Обновляем статус аккаунта как неактивный
++                key = (uid, acc_id)
++                IMAP_ACCOUNT_STATUS[key] = {"active": False, "email": getattr(acc, "email", "")}
++            except Exception as e:
++                log_send_event(f"IMAP: Error stopping account uid={uid} acc_id={acc.id}: {e}")
++        log_send_event(f"IMAP: All accounts stopped for uid={uid}")
+     except Exception as e:
+         log_send_event(f"IMAP: Error in _ensure_imap_stopped_for_user uid={uid}: {e}")
+ 
+ 
+-async def _get_user_accounts(uid: int) -> List[Any]:
++async def _get_user_accounts(uid: int) -> List[Account]:
+     return await list_accounts_async(uid)
+ 
+ def _split_active_inactive(accounts: List[Account]) -> Tuple[List[Account], List[Account]]:
+@@ -13179,41 +12699,38 @@ def _split_active_inactive(accounts: List[Account]) -> Tuple[List[Account], List
+     ina = [a for a in accounts if not a.active]
+     return act, ina
+     
+-def _runtime_is_active(uid: int, email: str) -> bool:
++def _runtime_is_active(uid: int, email: str, acc_id: int = None) -> bool:
+     """
+     Проверяет runtime-статус аккаунта: проверяет наличие активного аккаунта в обработке (новая архитектура).
++    ВАЖНО: Использует IMAP_ACCOUNT_STATUS и is_imap_account_active из imap_runtime.
+     """
+     try:
+-        st = IMAP_STATUS.get(uid)
+-        if isinstance(st, dict):
+-            st = ensure_user_imap_status(uid)
+-        
+-        if not st or not getattr(st, "running", False):
+-            return False
+-        
+-        # Проверяем наличие активного аккаунта в обработке
+-        # Ищем в accounts по email
+-        acc = st.accounts.get(email) if hasattr(st, "accounts") else None
+-        if not acc:
+-            return False
++        import imap_runtime
+         
+-        acc_id = int(getattr(acc, "id", 0))
+-        if not acc_id:
+-            return False
++        # Если acc_id не передан, ищем по email в IMAP_ACCOUNT_STATUS
++        if acc_id is None:
++            for key, status in IMAP_ACCOUNT_STATUS.items():
++                if key[0] == uid and status.get("email") == email:
++                    acc_id = key[1]
++                    break
++            if acc_id is None:
++                return False
+         
+-        # Проверяем, есть ли активный аккаунт в статусе (новая архитектура)
+         key = (uid, acc_id)
+-        account_status = IMAP_ACCOUNT_STATUS.get(key)
+-        if account_status and account_status.get("active", False):
++        
++        # ВАЖНО: Проверяем реальный статус через imap_runtime (это источник истины)
++        if imap_runtime.is_imap_account_active(uid, acc_id):
+             return True
+         
+-        return False
++        # Fallback: проверяем IMAP_ACCOUNT_STATUS
++        status = IMAP_ACCOUNT_STATUS.get(key, {})
++        return status.get("active", False)
+     except Exception:
+         return False
+ 
+ async def _kb_read_menu(uid: int) -> InlineKeyboardMarkup:
+     accounts = await _get_user_accounts(uid)
+-    need_start = [a for a in accounts if not _runtime_is_active(uid, a.email)]
++    need_start = [a for a in accounts if not _runtime_is_active(uid, a.email, int(getattr(a, "id", 0)))]
+     rows: list[list[InlineKeyboardButton]] = []
+     for i, a in enumerate(need_start, start=1):
+         rows.append([InlineKeyboardButton(text=f"E‑mail №{i}: {a.email}", callback_data=f"imap:start:{a.id}")])
+@@ -13223,7 +12740,7 @@ async def _kb_read_menu(uid: int) -> InlineKeyboardMarkup:
+ 
+ async def _kb_stop_menu(uid: int) -> InlineKeyboardMarkup:
+     accounts = await _get_user_accounts(uid)
+-    act_runtime = [a for a in accounts if _runtime_is_active(uid, a.email)]
++    act_runtime = [a for a in accounts if _runtime_is_active(uid, a.email, int(getattr(a, "id", 0)))]
+     rows: list[list[InlineKeyboardButton]] = []
+     for i, a in enumerate(act_runtime, start=1):
+         rows.append([InlineKeyboardButton(text=f"E‑mail №{i}: {a.email}", callback_data=f"imap:stop:{a.id}")])
+@@ -13243,7 +12760,7 @@ async def cmd_read(m: types.Message):
+     if not accounts:
+         await bot.send_message(m.chat.id, "Аккаунтов не найдено.")
+         return
+-    need_start_exists = any(not _runtime_is_active(uid, a.email) for a in accounts)
++    need_start_exists = any(not _runtime_is_active(uid, a.email, int(getattr(a, "id", 0))) for a in accounts)
+     text = "Нажмите на E‑mail для запуска потока чтения:" if need_start_exists else "Все потоки уже запущены."
+     kb = await _kb_read_menu(uid)
+     await bot.send_message(m.chat.id, text, reply_markup=kb)
+@@ -13408,9 +12925,9 @@ async def _status_text(uid: int) -> str:
+ 
+     lines: list[str] = []
+     for a in accounts:
+-        # ВАЖНО: Используем ту же логику, что и в /read команде
+-        is_active = _runtime_is_active(uid, a.email)
+-        acc_id = getattr(a, "id", 0)
++        acc_id = int(getattr(a, "id", 0))
++        # ВАЖНО: Используем acc_id напрямую для более точной проверки
++        is_active = _runtime_is_active(uid, a.email, acc_id)
+         send_enabled = acc_id not in disabled
+         send_mark = "🟢send" if send_enabled else "🔴send"
+ 
+@@ -13476,64 +12993,55 @@ async def cmd_status(m: types.Message):
+ 
+ @dp.callback_query(F.data.startswith("imap:start:"))
+ async def imap_start_one(c: types.CallbackQuery):
+-    """Запуск процесса IMAP для одного аккаунта"""
+-    if not await ensure_approved(c): return
++    """Запуск IMAP-runtime для одного аккаунта (без автозапуска остальных)."""
++    if not await ensure_approved(c):
++        return
+     uid = await U(c)
+     acc_id = int(c.data.split(":")[2])
+ 
+     acc = await get_account_async(uid, acc_id)
+     if not acc:
+-        await c.answer("Аккаунт не найден", show_alert=True); return
++        await c.answer("Аккаунт не найден", show_alert=True)
++        return
+ 
+     await set_account_active_async(uid, acc_id, True)
+     email = getattr(acc, "email", "")
+ 
++    # Сброс лог-флагов (оставляем твою механику)
+     key = (uid, email)
+     START_LOG_SENT.pop(key, None)
+     ERROR_LOG_SENT.pop(key, None)
+ 
+-    st = ensure_user_imap_status(uid)
+-    async with st.lock:
+-        st.running = True
+-        st.account_status.setdefault("_meta", {})["chat_id"] = c.message.chat.id
+-        st.account_status.setdefault(email, {})
+-        st.account_status[email].update({
+-            "retry_at": 0,
+-            "retries": 0,
+-            "last_err": None,
+-            "active": False,
+-        })
+-
+-    # Получаем контекст для прокси
+-    ctx = await get_user_ctx_async(uid)
+-    # Получаем прокси для аккаунта (ОБЯЗАТЕЛЬНО)
+-    proxy = None
++    # Хост и прокси
++    host = resolve_imap_host(email)
+     try:
+-        proxy = smtp25.get_next_proxy_ctx(ctx, "send")
++        proxy = await get_account_proxy_async(uid, email)
+     except Exception as e:
+-        log_send_event(f"IMAP: Failed to get proxy for uid={uid} acc_id={acc_id} email={email}: {e}")
+-    
+-    # Проверка наличия прокси перед запуском
+-    if not proxy:
+-        await safe_cq_answer(c, f"❌ Не удалось запустить чтение: нет доступного прокси (прокси обязателен для IMAP)")
+-        log_send_event(f"IMAP: Cannot start process for uid={uid} acc_id={acc_id} email={email}: no proxy available (proxy is required)")
+-        return
+-    
+-    # Запускаем процесс (прокси уже проверен в start_imap_process)
+-    success = await start_imap_process(
++        log_send_event(f"IMAP_RUNTIME: Failed to get proxy for uid={uid} acc_id={acc_id} email={email}: {e}")
++        proxy = None
++
++    # Конфиг для нового runtime
++    cfg_rt = imap_runtime.ImapAccountConfig(
+         user_id=uid,
+         acc_id=acc_id,
+         email=email,
+         password=getattr(acc, "password", ""),
+         display_name=getattr(acc, "display_name", "") or getattr(acc, "name", "") or "",
+         chat_id=c.message.chat.id,
+-        proxy=proxy
++        host=host,
++        proxy=proxy,
+     )
+-    
+-    if not success:
+-        await safe_cq_answer(c, f"❌ Не удалось запустить чтение (проверьте логи)")
++
++    try:
++        imap_runtime.start_imap_for_account(cfg_rt)
++        # Обновляем статус аккаунта как активный
++        key = (uid, acc_id)
++        IMAP_ACCOUNT_STATUS[key] = {"active": True, "email": email}
++    except Exception as e:
++        log_send_event(f"IMAP_RUNTIME: Cannot start worker for uid={uid} acc_id={acc_id} email={email}: {e}")
++        await safe_cq_answer(c, "❌ Не удалось запустить чтение (проверьте логи)")
+         return
+-    
++
+     kb = await _kb_read_menu(uid)
+     await safe_edit_message(c.message, "Нажмите на E‑mail для запуска потока чтения:", reply_markup=kb)
+     await safe_cq_answer(c, "Запущено")
+@@ -13541,53 +13049,57 @@ async def imap_start_one(c: types.CallbackQuery):
+ @dp.callback_query(F.data == "imap:start_all")
+ async def imap_start_all(c: types.CallbackQuery):
+     """
+-    Запустить все потоки: активируем все аккаунты и инициируем "startup burst".
+-    Добавлен случайный джиттер для account_backoff, чтобы избежать лавины соединений.
++    Запускает все потоки: активирует аккаунты и стартует IMAP-runtime для каждого активного.
++    Автозапуска при /read нет — только по этой кнопке.
+     """
+-    if not await ensure_approved(c): 
++    if not await ensure_approved(c):
+         return
+     uid = await U(c)
+ 
+     accounts = await list_accounts_async(uid)
+     # Активируем все неактивные
+-    to_activate_emails = [getattr(row, "email") for row in accounts if not getattr(row, "active", False)]
+-    if to_activate_emails:
++    to_activate_ids = [getattr(row, "id") for row in accounts if not getattr(row, "active", False)]
++    if to_activate_ids:
+         await activate_all_accounts_async(uid)
+ 
+-    # Собираем актуальный список активных аккаунтов
++    # Обновляем список активных
+     accounts = await list_accounts_async(uid)
+     active_accounts = [a for a in accounts if getattr(a, "active", False) and getattr(a, "email", "")]
+ 
+-    st = ensure_user_imap_status(uid)
+-    async with st.lock:
+-        now = time.time()
+-        # Сброс лог‑флагов и установка «почти немедленного» due с джиттером
+-        for a in active_accounts:
+-            email = getattr(a, "email", "")
+-            key = (uid, email)
+-            START_LOG_SENT.pop(key, None)
+-            ERROR_LOG_SENT.pop(key, None)
+-            st.account_status.setdefault(email, {})
+-            st.account_status[email].update({
+-                "retry_at": 0,
+-                "retries": 0,
+-                "last_err": None,
+-                # НЕ устанавливаем active=False здесь - это будет установлено в start_imap_process
+-            })
+-            # небольшой джиттер до 2 секунд, чтобы не стартовали все одновременно
+-            st.account_backoff[email] = now + random.uniform(0.0, 2.0)
++    chat_id = c.message.chat.id
++
++    for acc in active_accounts:
++        email = getattr(acc, "email", "")
++        host = resolve_imap_host(email)
+ 
+-        # Кэш активных аккаунтов и подготовка очереди обхода
+-        st.accounts = {getattr(a, "email"): a for a in active_accounts}
+-        st.last_accounts_check = time.time()
++        # Сброс логов
++        key = (uid, email)
++        START_LOG_SENT.pop(key, None)
++        ERROR_LOG_SENT.pop(key, None)
+ 
+-        meta = st.account_status.setdefault("_meta", {})
+-        meta["poll_list"] = list(st.accounts.keys())
+-        meta["poll_idx"] = 0
+-        meta["startup_burst"] = True  # включаем залповый первый проход
++        try:
++            proxy = await get_account_proxy_async(uid, email)
++        except Exception as e:
++            log_send_event(f"IMAP_RUNTIME: Failed to get proxy (start_all) uid={uid} acc_id={acc.id} email={email}: {e}")
++            proxy = None
+ 
+-    # Стартуем фоновую задачу (если ещё не запущена)
+-    await _ensure_imap_started_for_user(uid, c.message.chat.id)
++        cfg_rt = imap_runtime.ImapAccountConfig(
++            user_id=uid,
++            acc_id=int(getattr(acc, "id")),
++            email=email,
++            password=getattr(acc, "password", ""),
++            display_name=getattr(acc, "display_name", "") or getattr(acc, "name", "") or "",
++            chat_id=chat_id,
++            host=host,
++            proxy=proxy,
++        )
++        try:
++            imap_runtime.start_imap_for_account(cfg_rt)
++            # Обновляем статус аккаунта как активный
++            key = (uid, int(getattr(acc, "id")))
++            IMAP_ACCOUNT_STATUS[key] = {"active": True, "email": email}
++        except Exception as e:
++            log_send_event(f"IMAP_RUNTIME: Cannot start worker (start_all) uid={uid} acc_id={acc.id} email={email}: {e}")
+ 
+     kb = await _kb_stop_menu(uid)
+     await safe_edit_message(c.message, "Все потоки запущены.", reply_markup=kb)
+@@ -13595,7 +13107,7 @@ async def imap_start_all(c: types.CallbackQuery):
+ 
+ @dp.callback_query(F.data.startswith("imap:stop:"))
+ async def imap_stop_one(c: types.CallbackQuery):
+-    """Остановка процесса IMAP для одного аккаунта"""
++    """Остановка IMAP-runtime для одного аккаунта"""
+     if not await ensure_approved(c):
+         return
+     uid = await U(c)
+@@ -13609,30 +13121,25 @@ async def imap_stop_one(c: types.CallbackQuery):
+     await set_account_active_async(uid, acc_id, False)
+     email = getattr(acc, "email", "")
+ 
+-    # Останавливаем процесс
+-    success = await stop_imap_process(uid, acc_id)
+-    if success:
+-        log_send_event(f"IMAP: Account stopped successfully uid={uid} acc_id={acc_id} email={email}")
+-    else:
+-        log_send_event(f"IMAP: Account stop completed (was not in queue) uid={uid} acc_id={acc_id} email={email}")
+-
+-    st = ensure_user_imap_status(uid)
+-    async with st.lock:
+-        st.account_status.setdefault(email, {})
+-        st.account_status[email].update({"active": False})
++    try:
++        imap_runtime.stop_imap_for_account(uid, acc_id)
++        # Обновляем статус аккаунта как неактивный
++        key = (uid, acc_id)
++        IMAP_ACCOUNT_STATUS[key] = {"active": False, "email": email}
++        log_send_event(f"IMAP_RUNTIME: Account stopped uid={uid} acc_id={acc_id} email={email}")
++    except Exception as e:
++        log_send_event(f"IMAP_RUNTIME: Error stopping account uid={uid} acc_id={acc_id} email={email}: {e}")
+ 
+-    # Ограничение скорости: не более 1 сообщения в 2 секунды
+     chat_id = c.message.chat.id
+     now = time.time()
+     last_ts = _LAST_STOP_MESSAGE_TS.get(chat_id, 0)
+     elapsed = now - last_ts
+-    
++
+     if elapsed < STOP_MESSAGE_MIN_INTERVAL:
+-        # Ждем, пока пройдет минимальный интервал
+         wait_time = STOP_MESSAGE_MIN_INTERVAL - elapsed
+         await asyncio.sleep(wait_time)
+         now = time.time()
+-    
++
+     await c.message.answer(f"Поток для {code(email)} остановлен⚡")
+     _LAST_STOP_MESSAGE_TS[chat_id] = now
+ 
+@@ -13646,6 +13153,7 @@ async def imap_stop_one(c: types.CallbackQuery):
+     await safe_edit_message(c.message, text, reply_markup=kb)
+     await safe_cq_answer(c, "Остановлено")
+     
++
+ @dp.callback_query(F.data == "imap:stop_all")
+ async def imap_stop_all(c: types.CallbackQuery):
+     if not await ensure_approved(c):
+@@ -13657,38 +13165,30 @@ async def imap_stop_all(c: types.CallbackQuery):
+     if emails:
+         await deactivate_all_accounts_async(uid)
+ 
+-    st = ensure_user_imap_status(uid)
+     chat_id = c.message.chat.id
+-    
+-    # Обновляем статусы аккаунтов (быстро, внутри lock)
+-    async with st.lock:
+-        for email in emails:
+-            st.account_status.setdefault(email, {})
+-            st.account_status[email].update({"active": False})
+-    
+-    # Отправляем сообщения об остановке с ограничением скорости (вне lock)
++
++    # сообщение об остановке для каждого
+     for email in emails:
+         try:
+-            # Ограничение скорости: не более 1 сообщения в 2 секунды
+             now = time.time()
+             last_ts = _LAST_STOP_MESSAGE_TS.get(chat_id, 0)
+             elapsed = now - last_ts
+-            
++
+             if elapsed < STOP_MESSAGE_MIN_INTERVAL:
+-                # Ждем, пока пройдет минимальный интервал
+                 wait_time = STOP_MESSAGE_MIN_INTERVAL - elapsed
+                 await asyncio.sleep(wait_time)
+                 now = time.time()
+-            
++
+             await c.message.answer(f"Поток для {code(email)} остановлен⚡")
+             _LAST_STOP_MESSAGE_TS[chat_id] = now
+         except Exception:
+             pass
+ 
+-    # Останавливаем все процессы IMAP для пользователя
+-    log_send_event(f"IMAP: Stopping all accounts for uid={uid} (count={len(emails)})")
++    # Останавливаем все runtime-воркеры
++    log_send_event(f"IMAP_RUNTIME: Stopping all accounts for uid={uid} (count={len(emails)})")
+     await _ensure_imap_stopped_for_user(uid)
+-    log_send_event(f"IMAP: All accounts stopped for uid={uid}")
++    log_send_event(f"IMAP_RUNTIME: All accounts stopped for uid={uid}")
++
+     kb = await _kb_stop_menu(uid)
+     await safe_edit_message(c.message, "Нет активных потоков.", reply_markup=kb)
+     await safe_cq_answer(c, "Остановлено")
+@@ -13903,113 +13403,69 @@ async def cleanup_user_runtime(user_id: int):
+             QUICK_ADD_ACTIVATED_AT.pop(key, None)
+     except Exception:
+         pass
+-
+-
+-
+-
+-
+-    
+-
+-
+-
+-
++        
++        
+ async def main():
+     """
+     Полный main с инициализацией бота, неблокирующим логгером, прогревом кэшей,
+-    запуском планировщиков (cleanup + глобальные IMAP‑воркеры), установкой /команд
++    запуском планировщиков (cleanup + IMAP‑runtime), установкой /команд
+     и корректным завершением.
+     """
+     global bot
+ 
+     # 1) Инициализация бота (aiogram v3)
+-    # Настраиваем TCPConnector для использования только IPv4 (избегаем проблем с PySocks и IPv6)
+-    # ВАЖНО: PySocks не поддерживает IPv6, поэтому принудительно используем только IPv4
+-    # Проблема: aiohttp использует aiohappyeyeballs, который пытается использовать IPv6,
+-    # даже если мы указали family=socket.AF_INET. Решение: модифицируем socket.getaddrinfo
+-    # на глобальном уровне для фильтрации IPv6 адресов.
+     import socket
+-    
+-    # Сохраняем оригинальные функции для возможного восстановления
+     _original_socket_getaddrinfo = socket.getaddrinfo
+-    
++
+     def ipv4_only_socket_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+-        """
+-        Обертка над socket.getaddrinfo, которая фильтрует IPv6 адреса.
+-        Возвращает только IPv4 адреса (AF_INET).
+-        Это предотвращает использование IPv6 через aiohappyeyeballs в aiohttp,
+-        что вызывает ошибки при работе с PySocks (который не поддерживает IPv6).
+-        """
+-        # Принудительно используем только IPv4
+         if family == 0 or family == socket.AF_UNSPEC:
+             family = socket.AF_INET
+         elif family != socket.AF_INET:
+-            # Если явно запрашивается IPv6, возвращаем пустой список
+             return []
+-        
+-        # Вызываем оригинальный getaddrinfo с принудительным IPv4
+         try:
+             results = _original_socket_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+-            # Фильтруем результаты - оставляем только IPv4 (на всякий случай)
+             ipv4_results = [r for r in results if r and len(r) > 0 and r[0] == socket.AF_INET]
+             return ipv4_results if ipv4_results else results
+         except Exception:
+-            # В случае ошибки возвращаем пустой список
+             return []
+-    
+-    # Заменяем socket.getaddrinfo на глобальном уровне
+-    # ВАЖНО: Это влияет на все HTTP-запросы в основном потоке (aiogram, aiohttp),
+-    # но не влияет на executor-потоки (где используется локальная модификация для SMTP)
++
+     socket.getaddrinfo = ipv4_only_socket_getaddrinfo
+-    
+-    # Также модифицируем asyncio.getaddrinfo, если он используется (aiohappyeyeballs может использовать его)
++
+     try:
+         import asyncio
+-        _original_asyncio_getaddrinfo = asyncio.getaddrinfo
+-        
++        _original_asyncio_getaddrinfo = asyncio.getaddrinfo  # type: ignore[attr-defined]
++
+         async def ipv4_only_asyncio_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+-            """
+-            Обертка над asyncio.getaddrinfo, которая фильтрует IPv6 адреса.
+-            Возвращает только IPv4 адреса (AF_INET).
+-            """
+-            # Принудительно используем только IPv4
+             if family == 0 or family == socket.AF_UNSPEC:
+                 family = socket.AF_INET
+             elif family != socket.AF_INET:
+-                # Если явно запрашивается IPv6, возвращаем пустой список
+                 return []
+-            
+-            # Вызываем оригинальный getaddrinfo с принудительным IPv4
+             try:
+-                results = await _original_asyncio_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+-                # Фильтруем результаты - оставляем только IPv4
++                results = await _original_asyncio_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)  # type: ignore[attr-defined]
+                 ipv4_results = [r for r in results if r and len(r) > 0 and r[0] == socket.AF_INET]
+                 return ipv4_results if ipv4_results else results
+             except Exception:
+-                # В случае ошибки возвращаем пустой список
+                 return []
+-        
+-        asyncio.getaddrinfo = ipv4_only_asyncio_getaddrinfo
++
++        asyncio.getaddrinfo = ipv4_only_asyncio_getaddrinfo  # type: ignore[assignment]
+         log_send_event("STARTUP: IPv4-only mode enabled for HTTP requests (socket.getaddrinfo and asyncio.getaddrinfo patched)")
+     except (ImportError, AttributeError):
+-        # Если asyncio.getaddrinfo недоступен, используем только socket.getaddrinfo
+         log_send_event("STARTUP: IPv4-only mode enabled for HTTP requests (socket.getaddrinfo patched)")
+-    
+-    # Создаем AiohttpSession (патч socket.getaddrinfo уже обеспечивает использование только IPv4)
+-    # AiohttpSession создает коннектор внутри себя, но патч getaddrinfo гарантирует IPv4
++
+     bot_session = AiohttpSession()
+     bot = Bot(
+         token=_get_bot_token(),
+         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+-        session=bot_session
++        session=bot_session,
+     )
+     log_send_event("STARTUP: Bot initialized with IPv4-only mode (via socket.getaddrinfo patch)")
+ 
+-    # 2) Логгер отправки — неблокирующий (фоновая нитка пишет в файл)
++    # 2) Логгер
+     setup_nonblocking_send_logger()
+ 
+-    # 3) Прогрев персистентных кэшей (необязательно, но ускоряет старт)
++    # 3) Кэши
+     try:
+-        load_user_ctx_caches_on_start(ttl_seconds=172800)  # 48ч
++        load_user_ctx_caches_on_start(ttl_seconds=172800)
+     except Exception as e:
+         log_send_event(f"STARTUP: load_user_ctx_caches_on_start error: {e}")
+     try:
+@@ -14017,42 +13473,26 @@ async def main():
+     except Exception as e:
+         log_send_event(f"STARTUP: load_ad_caches_on_start error: {e}")
+     try:
+-        load_ai_sender_dedup_caches_on_start(ttl_seconds=604800)  # 7 дней
++        load_ai_sender_dedup_caches_on_start(ttl_seconds=604800)
+     except Exception as e:
+         log_send_event(f"STARTUP: load_ai_sender_dedup_caches_on_start error: {e}")
+ 
+-    # 4) Фоновые задачи: планировщик одноразовой очистки каждые 48ч
++    # 4) Планировщик очистки
+     cleanup_task: asyncio.Task | None = None
+     try:
+         cleanup_task = asyncio.create_task(cleanup_scheduler())
+     except Exception as e:
+         log_send_event(f"STARTUP: cannot start cleanup_scheduler: {e}")
+ 
+-    # 5) IMAP пул воркеров и обработка результатов
+-    # Инициализируем пул воркеров при старте приложения
+-    try:
+-        if init_imap_worker_pool():
+-            log_send_event("STARTUP: IMAP worker pool initialized")
+-        else:
+-            log_send_event("STARTUP: IMAP worker pool initialization failed")
+-    except Exception as e:
+-        log_send_event(f"STARTUP: IMAP worker pool initialization error: {e}")
+-    
+-    # Запускаем глобальный обработчик результатов из очереди воркеров
++    # 5) Новый IMAP runtime + дренер
+     imap_result_processor_task: asyncio.Task | None = None
+     try:
+-        imap_result_processor_task = asyncio.create_task(_process_imap_results_global())
+-        log_send_event("STARTUP: IMAP result processor started")
+-    except Exception as e:
+-        log_send_event(f"STARTUP: cannot start IMAP result processor: {e}")
+-    
+-    # Запускаем watchdog для перезапуска упавших воркеров
+-    watchdog_task: asyncio.Task | None = None
+-    try:
+-        watchdog_task = asyncio.create_task(_imap_watchdog())
+-        log_send_event("STARTUP: IMAP watchdog started")
++        imap_runtime.init_imap_runtime()
++        imap_result_processor_task = asyncio.create_task(imap_results_drain_loop())
++        log_send_event("STARTUP: IMAP runtime initialized and result drainer started")
+     except Exception as e:
+-        log_send_event(f"STARTUP: cannot start IMAP watchdog: {e}")
++        log_send_event(f"STARTUP: IMAP runtime initialization error: {e}")
++        imap_result_processor_task = None
+ 
+     # 6) /команды бота
+     try:
+@@ -14060,7 +13500,7 @@ async def main():
+     except Exception as e:
+         log_send_event(f"STARTUP: set_bot_commands failed: {e}")
+ 
+-    # 7) Запуск polling
++    # 7) Polling
+     try:
+         log_send_event("STARTUP: Starting bot polling...")
+         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+@@ -14071,14 +13511,11 @@ async def main():
+         log_send_event("SHUTDOWN: Bot stopped by system (SystemExit)")
+         raise
+     except Exception as e:
+-        # Критическая ошибка в polling - логируем и пробрасываем
+         log_send_event(f"CRITICAL: Bot polling failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+         raise
+     finally:
+-        # 1) Cancel & await все корутины, которые могут обращаться к bot или к сетевым сессиям
+-        # ВАЖНО: отменяем ДО закрытия bot.session и сетевых сессий
+-        
+-        # 1.1) Остановить планировщик очистки
++        # Остановка фоновых задач и ресурсов
++
+         try:
+             if cleanup_task:
+                 cleanup_task.cancel()
+@@ -14091,8 +13528,6 @@ async def main():
+         except Exception:
+             pass
+ 
+-        # 1.2) Остановить IMAP result processor
+-        # ВАЖНО: отменяем ДО shutdown_imap_worker_pool(), чтобы не читать из удалённой очереди
+         try:
+             if imap_result_processor_task:
+                 imap_result_processor_task.cancel()
+@@ -14104,22 +13539,7 @@ async def main():
+                     pass
+         except Exception:
+             pass
+-        
+-        # 1.3) Остановить IMAP watchdog
+-        try:
+-            if watchdog_task:
+-                watchdog_task.cancel()
+-                try:
+-                    await watchdog_task
+-                except asyncio.CancelledError:
+-                    pass
+-                except Exception:
+-                    pass
+-        except Exception:
+-            pass
+ 
+-        # 1.4) Отменить и await все OUTBOX_TASKS (per-user фоновые задачи)
+-        # ВАЖНО: эти задачи могут блокироваться на q.get() или bot.send_message()
+         try:
+             outbox_tasks_to_cancel = list(OUTBOX_TASKS.values())
+             for task in outbox_tasks_to_cancel:
+@@ -14139,8 +13559,6 @@ async def main():
+         except Exception:
+             pass
+ 
+-        # 1.5) Отменить и await все START_LOG_DRAINERS (per-user дренеры логов)
+-        # ВАЖНО: эти дренеры могут обращаться к bot.send_message()
+         try:
+             drainer_tasks_to_cancel = list(START_LOG_DRAINERS.values())
+             for task in drainer_tasks_to_cancel:
+@@ -14159,8 +13577,6 @@ async def main():
+         except Exception:
+             pass
+ 
+-        # 1.6) Отменить и await все SEND_TASKS (per-user задачи отправки)
+-        # ВАЖНО: эти задачи могут обращаться к bot.send_message()
+         try:
+             send_tasks_to_cancel = list(SEND_TASKS.values())
+             for task in send_tasks_to_cancel:
+@@ -14179,8 +13595,6 @@ async def main():
+         except Exception:
+             pass
+ 
+-        # 1.7) Отменить и await все AI_ASSISTANT_TASKS (per-user AI сценарии)
+-        # ВАЖНО: эти задачи могут обращаться к bot.send_message()
+         try:
+             ai_tasks_to_cancel = list(AI_ASSISTANT_TASKS.values())
+             for task in ai_tasks_to_cancel:
+@@ -14199,8 +13613,6 @@ async def main():
+         except Exception:
+             pass
+ 
+-        # 1.8) Отменить и await все schedule_ai_xlsx_autoverify._tasks (per-user задачи автопроверки XLSX)
+-        # ВАЖНО: эти задачи могут обращаться к bot.send_message()
+         try:
+             if hasattr(schedule_ai_xlsx_autoverify, "_tasks"):
+                 xlsx_tasks_to_cancel = list(schedule_ai_xlsx_autoverify._tasks.values())  # type: ignore[attr-defined]
+@@ -14220,28 +13632,22 @@ async def main():
+         except Exception:
+             pass
+ 
+-        # 2) Закрыть FSM‑хранилище
+         try:
+             await dp.storage.close()
+             await dp.storage.wait_closed()
+         except Exception:
+             pass
+ 
+-        # 3) Закрыть HTTP‑сессию бота
+-        # ВАЖНО: закрываем ПОСЛЕ отмены всех задач, которые могут использовать bot
+         try:
+             await bot.session.close()
+         except Exception:
+             pass
+ 
+-        # 4) Остановить неблокирующий логгер
+         try:
+             stop_nonblocking_send_logger()
+         except Exception:
+             pass
+ 
+-        # 5) Закрыть глобальную HTTP сессию
+-        # ВАЖНО: _HTTP_SESSION может остаться открытой, что приведет к ResourceWarning
+         try:
+             global _HTTP_SESSION
+             if _HTTP_SESSION and not _HTTP_SESSION.closed:
+@@ -14250,20 +13656,11 @@ async def main():
+         except Exception:
+             pass
+ 
+-        # 6) Остановить IMAP пул воркеров
+-        # ВАЖНО: вызываем ПОСЛЕ отмены imap_result_processor_task, чтобы он не пытался
+-        # читать из уже удалённой очереди. shutdown_imap_worker_pool() ставит stop-event
+-        # и безопасно terminate()/kill() зависшие процессы
+         try:
+-            shutdown_imap_worker_pool()
++            imap_runtime.shutdown_imap_runtime()
+         except Exception:
+             pass
+ 
+-        # 7) Завершить executors
+-        try:
+-            IMAP_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+-        except Exception:
+-            pass
+         try:
+             SHARED_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+         except Exception:
+@@ -14299,5 +13696,4 @@ if __name__ == "__main__":
+             # Если даже логирование не удалось, просто выводим в stderr
+             print(f"CRITICAL ERROR: Bot crashed: {type(e).__name__}: {e}", file=sys.stderr)
+         sys.exit(1)
+-# === Internal user id resolver with cache (U) ===
+-
++# === Internal user id resolver with cache (U) ===        
+\ No newline at end of file
